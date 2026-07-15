@@ -1,0 +1,20 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: paddington-postgres
+    environment:
+      POSTGRES_USER: paddington
+      POSTGRES_PASSWORD: paddington_dev_password
+      POSTGRES_DB: paddington
+    ports:
+      - "5432:5432"
+    volumes:
+      - paddington_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U paddington -d paddington"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  paddington_postgres_data:

@@ -1,0 +1,12 @@
+{
+    "python.defaultInterpreterPath": ".venv/bin/python",
+    "python.analysis.typeCheckingMode": "basic",
+    "python.analysis.autoImportCompletions": true,
+    "[python]": {
+      "editor.formatOnSave": true,
+      "editor.defaultFormatter": "charliermarsh.ruff",
+      "editor.codeActionsOnSave": {
+        "source.organizeImports.ruff": "explicit"
+      }
+    }
+}
