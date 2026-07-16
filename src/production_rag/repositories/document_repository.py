@@ -40,6 +40,10 @@ class DocumentRepository:
         content: str,
         token_count: int,
         embedding: list[float],
+        char_start: int | None = None,
+        char_end: int | None = None,
+        page: int | None = None,
+        section: str | None = None,
     ) -> DocumentChunk:
         chunk = DocumentChunk(
             document_id=document_id,
@@ -48,6 +52,10 @@ class DocumentRepository:
             content=content,
             token_count=token_count,
             embedding=embedding,
+            char_start=char_start,
+            char_end=char_end,
+            page=page,
+            section=section,
         )
         self._session.add(chunk)
         await self._session.flush()
