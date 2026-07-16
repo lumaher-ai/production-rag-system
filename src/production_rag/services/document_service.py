@@ -58,14 +58,14 @@ class DocumentService:
         # Step 1: Embed the question (Retrieval)
         query_embedding = await self._embedding_service.embed_text(question)
 
-        # Step 2: Find similar chunks (Retrieval)
-        chunks = await self._repository.search_similar_chunks(
+        # Step 2: Find similar chunks (Retrieval) — each paired with its similarity score
+        scored_chunks = await self._repository.search_similar_chunks(
             query_embedding=query_embedding,
             user_id=user_id,
             top_k=top_k,
         )
 
-        if not chunks:
+        if not scored_chunks:
             return QueryResponse(
                 answer="No documents found. Please upload documents first.",
                 sources=[],
@@ -77,7 +77,7 @@ class DocumentService:
 
         # Step 3: Build context from chunks (Augmented)
         context_parts = []
-        for i, chunk in enumerate(chunks):
+        for i, (chunk, _score) in enumerate(scored_chunks):
             document = await self._repository.get_document_by_id(chunk.document_id)
             context_parts.append(f"[Source {i + 1}: {document.title}]\n{chunk.content}")
         context = "\n\n---\n\n".join(context_parts)
@@ -92,7 +92,7 @@ class DocumentService:
 
         # Step 5: Build response with sources (Generation)
         sources = []
-        for i, chunk in enumerate(chunks):
+        for i, (chunk, score) in enumerate(scored_chunks):
             document = await self._repository.get_document_by_id(chunk.document_id)
             sources.append(
                 ChunkSource(
@@ -102,13 +102,14 @@ class DocumentService:
                     if len(chunk.content) > 200
                     else chunk.content,
                     similarity_rank=i + 1,
+                    similarity_score=round(score, 4),
                 )
             )
 
         logger.info(
             "rag_query_completed",
             question_length=len(question),
-            chunks_used=len(chunks),
+            chunks_used=len(scored_chunks),
             chunk_sources=sources,
             answer=llm_response.content,
             model=model,

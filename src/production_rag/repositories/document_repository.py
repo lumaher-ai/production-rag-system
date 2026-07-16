@@ -63,16 +63,24 @@ class DocumentRepository:
         query_embedding: list[float],
         user_id: UUID,
         top_k: int = 5,
-    ) -> list[DocumentChunk]:
-        """Find the most similar chunks to a query embedding using cosine distance."""
+    ) -> list[tuple[DocumentChunk, float]]:
+        """Find the most similar chunks to a query embedding using cosine distance.
+
+        Returns each chunk paired with its cosine *similarity* score in ``[-1, 1]``
+        (``1.0`` = identical direction). pgvector's ``<=>`` operator yields cosine
+        *distance*; similarity is ``1 - distance``, so higher is a better match.
+        The score is selected alongside the row rather than recomputed, so callers
+        can rank, threshold, or surface it without re-querying.
+        """
+        distance = DocumentChunk.embedding.cosine_distance(query_embedding)
         result = await self._session.execute(
-            select(DocumentChunk)
+            select(DocumentChunk, distance.label("distance"))
             .join(Document, DocumentChunk.document_id == Document.id)
             .where(Document.user_id == user_id)
-            .order_by(DocumentChunk.embedding.cosine_distance(query_embedding))
+            .order_by(distance)
             .limit(top_k)
         )
-        return list(result.scalars().all())
+        return [(row[0], 1.0 - row.distance) for row in result.all()]
 
     async def list_documents_by_user(
         self,
