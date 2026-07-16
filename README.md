@@ -221,10 +221,10 @@ Sequenced by production-signal-per-effort. The full file-level plan lives in **[
 
 These are tracked, not hidden — see the [roadmap](#-roadmap) and [technical report](docs/rag-production-roadmap.md):
 
-- **No vector index** → retrieval is O(n); fine for a demo corpus, unusable at scale.
 - **Text-only ingestion** → real documents are files; loaders are Phase 2.
-- **No evaluation** → retrieval and answer quality are currently unmeasured.
-- **Vector-only retrieval** → no keyword/hybrid recall, no reranking precision lift yet.
+- **Vector-only retrieval** → no keyword/hybrid recall, no reranking precision lift yet (Phase 3).
+- **No evaluation** → retrieval and answer quality are not yet measured; the eval harness is Phase 4.
+- **Denormalized chunk titles** → each chunk stores a copy of its document title for fast retrieval, so a future document-rename endpoint must also update those copies.
 
 ---
 
