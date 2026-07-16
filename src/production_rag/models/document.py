@@ -34,6 +34,10 @@ class DocumentChunk(Base):
         ForeignKey("documents.id", ondelete="CASCADE"),
         nullable=False,
     )
+    # Denormalized copy of the parent document's title. Retrieval returns chunks
+    # ranked by similarity; carrying the title here lets query()/search_documents
+    # build sources without an extra per-chunk lookup of the parent (avoids N+1).
+    document_title: Mapped[str] = mapped_column(String(255), nullable=False)
     chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     token_count: Mapped[int] = mapped_column(Integer, nullable=False)

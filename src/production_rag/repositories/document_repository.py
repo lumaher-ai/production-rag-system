@@ -35,6 +35,7 @@ class DocumentRepository:
     async def create_chunk(
         self,
         document_id: UUID,
+        document_title: str,
         chunk_index: int,
         content: str,
         token_count: int,
@@ -42,6 +43,7 @@ class DocumentRepository:
     ) -> DocumentChunk:
         chunk = DocumentChunk(
             document_id=document_id,
+            document_title=document_title,
             chunk_index=chunk_index,
             content=content,
             token_count=token_count,

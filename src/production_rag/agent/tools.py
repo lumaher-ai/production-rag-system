@@ -37,9 +37,9 @@ def build_db_tools(
 
         results = []
         for i, (chunk, score) in enumerate(scored_chunks):
-            doc = await document_repository.get_document_by_id(chunk.document_id)
             results.append(
-                f"[Result {i + 1} from '{doc.title}' · relevance {score:.2f}]\n{chunk.content}"
+                f"[Result {i + 1} from '{chunk.document_title}' · relevance {score:.2f}]"
+                f"\n{chunk.content}"
             )
 
         return "\n\n---\n\n".join(results)

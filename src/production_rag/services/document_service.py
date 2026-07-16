@@ -78,8 +78,7 @@ class DocumentService:
         # Step 3: Build context from chunks (Augmented)
         context_parts = []
         for i, (chunk, _score) in enumerate(scored_chunks):
-            document = await self._repository.get_document_by_id(chunk.document_id)
-            context_parts.append(f"[Source {i + 1}: {document.title}]\n{chunk.content}")
+            context_parts.append(f"[Source {i + 1}: {chunk.document_title}]\n{chunk.content}")
         context = "\n\n---\n\n".join(context_parts)
 
         # Step 4: Call LLM with context (Generation)
@@ -93,11 +92,10 @@ class DocumentService:
         # Step 5: Build response with sources (Generation)
         sources = []
         for i, (chunk, score) in enumerate(scored_chunks):
-            document = await self._repository.get_document_by_id(chunk.document_id)
             sources.append(
                 ChunkSource(
                     chunk_id=chunk.id,
-                    document_title=document.title,
+                    document_title=chunk.document_title,
                     content_preview=chunk.content[:200] + "..."
                     if len(chunk.content) > 200
                     else chunk.content,
@@ -161,6 +159,7 @@ class DocumentService:
         for i, (text, embedding) in enumerate(zip(chunk_texts, embeddings, strict=True)):
             chunk = await self._repository.create_chunk(
                 document_id=document.id,
+                document_title=document.title,
                 chunk_index=i,
                 content=text,
                 token_count=count_tokens(text),
