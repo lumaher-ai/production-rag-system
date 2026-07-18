@@ -13,8 +13,9 @@ from production_rag.database import Base
 # Import all models so Alembic detects them
 from production_rag.models import (
     document,  # noqa: F401
+    query_cache,  # noqa: F401
     refresh_token,  # noqa: F401
-    user,  # noqa: F401  # noqa: F401
+    user,  # noqa: F401
 )
 
 config = context.config

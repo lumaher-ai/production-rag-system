@@ -1,13 +1,18 @@
+from datetime import datetime, timedelta, timezone
+from typing import Any
 from uuid import UUID
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from sqlalchemy.exc import IntegrityError
 
+from production_rag.ingestion.idempotency import content_hash, query_idempotency_key
 from production_rag.ingestion.loaders import ExtractedSegment
 from production_rag.llm.client import LLMClient, count_tokens
 from production_rag.llm.embedding_service import EmbeddingService
 from production_rag.logging_config import get_logger
 from production_rag.models.document import Document
 from production_rag.repositories.document_repository import DocumentRepository
+from production_rag.repositories.query_cache_repository import QueryCacheRepository
 from production_rag.schemas.document import ChunkSource, QueryResponse
 
 logger = get_logger(__name__)
@@ -15,6 +20,10 @@ logger = get_logger(__name__)
 # Chunking config
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
+# Version of the chunking behaviour above. Part of every idempotency key — BUMP
+# this whenever CHUNK_SIZE / CHUNK_OVERLAP / separators / splitter change, so
+# content chunked under the old config is re-embedded instead of served stale.
+CHUNKER_VERSION = "recursive-char-v1"
 
 # Prompt
 
@@ -38,10 +47,14 @@ class DocumentService:
         repository: DocumentRepository,
         embedding_service: EmbeddingService,
         llm_client: LLMClient,
+        query_cache_repository: QueryCacheRepository,
+        query_cache_ttl_seconds: int = 3600,
     ) -> None:
         self._repository = repository
         self._embedding_service = embedding_service
         self._llm = llm_client
+        self._query_cache = query_cache_repository
+        self._query_cache_ttl_seconds = query_cache_ttl_seconds
         self._splitter = RecursiveCharacterTextSplitter(
             chunk_size=CHUNK_SIZE,
             chunk_overlap=CHUNK_OVERLAP,

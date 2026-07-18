@@ -55,6 +55,16 @@ class Settings(BaseSettings):
         description="Maximum accepted upload size in bytes (10 MiB)",
     )
 
+    # Ingestion / retrieval
+    embedding_model: str = Field(
+        default="text-embedding-3-small",
+        description="Embedding model — part of every idempotency key",
+    )
+    query_cache_ttl_seconds: int = Field(
+        default=3600,
+        description="Time-to-live for cached query answers (seconds)",
+    )
+
     openai_api_key: str = Field(default="", description="OpenAI API key")
     anthropic_api_key: str = Field(default="", description="Anthropic API key")
 

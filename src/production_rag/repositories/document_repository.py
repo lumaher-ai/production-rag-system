@@ -21,20 +21,51 @@ class DocumentRepository:
         content: str,
         user_id: UUID,
         chunk_count: int,
+        content_hash: str,
+        chunker_version: str,
+        embedding_model: str,
+        source: str | None = None,
     ) -> Document:
         document = Document(
             title=title,
             content=content,
             user_id=user_id,
             chunk_count=chunk_count,
+            content_hash=content_hash,
+            chunker_version=chunker_version,
+            embedding_model=embedding_model,
+            source=source,
         )
         self._session.add(document)
         await self._session.flush()
         return document
 
+    async def get_document_by_idempotency(
+        self,
+        user_id: UUID,
+        content_hash: str,
+        chunker_version: str,
+        embedding_model: str,
+    ) -> Document | None:
+        """Return the document already ingested for this exact identity, if any.
+
+        The identity mirrors the ``uq_documents_idempotency`` constraint so a
+        repeat ingest can short-circuit before any embedding work happens.
+        """
+        result = await self._session.execute(
+            select(Document).where(
+                Document.user_id == user_id,
+                Document.content_hash == content_hash,
+                Document.chunker_version == chunker_version,
+                Document.embedding_model == embedding_model,
+            )
+        )
+        return result.scalar_one_or_none()
+
     async def create_chunk(
         self,
         document_id: UUID,
+        owner_id: UUID,
         document_title: str,
         chunk_index: int,
         content: str,
@@ -47,6 +78,7 @@ class DocumentRepository:
     ) -> DocumentChunk:
         chunk = DocumentChunk(
             document_id=document_id,
+            owner_id=owner_id,
             document_title=document_title,
             chunk_index=chunk_index,
             content=content,
@@ -84,9 +116,10 @@ class DocumentRepository:
         """
         distance = DocumentChunk.embedding.cosine_distance(query_embedding)
         result = await self._session.execute(
+            # Owner scope comes from the denormalized owner_id — no join to
+            # documents needed (title is already carried on the chunk too).
             select(DocumentChunk, distance.label("distance"))
-            .join(Document, DocumentChunk.document_id == Document.id)
-            .where(Document.user_id == user_id)
+            .where(DocumentChunk.owner_id == user_id)
             .order_by(distance)
             .limit(top_k)
         )
