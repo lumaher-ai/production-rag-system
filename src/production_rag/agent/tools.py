@@ -26,19 +26,21 @@ def build_db_tools(
             top_k: Number of results to return (default: 5).
         """
         query_embedding = await embedding_service.embed_text(query)
-        chunks = await document_repository.search_similar_chunks(
+        scored_chunks = await document_repository.search_similar_chunks(
             query_embedding=query_embedding,
             user_id=user_id,
             top_k=top_k,
         )
 
-        if not chunks:
+        if not scored_chunks:
             return "No relevant documents found."
 
         results = []
-        for i, chunk in enumerate(chunks):
-            doc = await document_repository.get_document_by_id(chunk.document_id)
-            results.append(f"[Result {i + 1} from '{doc.title}']\n{chunk.content}")
+        for i, (chunk, score) in enumerate(scored_chunks):
+            results.append(
+                f"[Result {i + 1} from '{chunk.document_title}' · relevance {score:.2f}]"
+                f"\n{chunk.content}"
+            )
 
         return "\n\n---\n\n".join(results)
 

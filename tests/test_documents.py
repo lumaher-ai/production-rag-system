@@ -104,6 +104,13 @@ async def test_query_returns_answer_with_sources(pg_async_client: AsyncClient) -
     assert "answer" in data
     assert len(data["sources"]) > 0
     assert data["sources"][0]["document_title"] == "Knowledge Base"
+    # Similarity score is exposed, numeric, and in the valid cosine range.
+    top_score = data["sources"][0]["similarity_score"]
+    assert isinstance(top_score, float)
+    assert -1.0 <= top_score <= 1.0
+    # Results are ordered best-match-first: scores are non-increasing by rank.
+    scores = [s["similarity_score"] for s in data["sources"]]
+    assert scores == sorted(scores, reverse=True)
     assert data["model"] == "gpt-4o-mini"
 
     app.dependency_overrides.pop(get_embedding_service, None)

@@ -45,6 +45,7 @@ class DocumentService:
             chunk_size=CHUNK_SIZE,
             chunk_overlap=CHUNK_OVERLAP,
             separators=["\n\n", "\n", ". ", " ", ""],  # Recursive character splitting strategy
+            add_start_index=True,  # record each chunk's offset in the source (for citations)
         )
 
     async def query(
@@ -58,14 +59,14 @@ class DocumentService:
         # Step 1: Embed the question (Retrieval)
         query_embedding = await self._embedding_service.embed_text(question)
 
-        # Step 2: Find similar chunks (Retrieval)
-        chunks = await self._repository.search_similar_chunks(
+        # Step 2: Find similar chunks (Retrieval) — each paired with its similarity score
+        scored_chunks = await self._repository.search_similar_chunks(
             query_embedding=query_embedding,
             user_id=user_id,
             top_k=top_k,
         )
 
-        if not chunks:
+        if not scored_chunks:
             return QueryResponse(
                 answer="No documents found. Please upload documents first.",
                 sources=[],
@@ -77,9 +78,8 @@ class DocumentService:
 
         # Step 3: Build context from chunks (Augmented)
         context_parts = []
-        for i, chunk in enumerate(chunks):
-            document = await self._repository.get_document_by_id(chunk.document_id)
-            context_parts.append(f"[Source {i + 1}: {document.title}]\n{chunk.content}")
+        for i, (chunk, _score) in enumerate(scored_chunks):
+            context_parts.append(f"[Source {i + 1}: {chunk.document_title}]\n{chunk.content}")
         context = "\n\n---\n\n".join(context_parts)
 
         # Step 4: Call LLM with context (Generation)
@@ -92,23 +92,23 @@ class DocumentService:
 
         # Step 5: Build response with sources (Generation)
         sources = []
-        for i, chunk in enumerate(chunks):
-            document = await self._repository.get_document_by_id(chunk.document_id)
+        for i, (chunk, score) in enumerate(scored_chunks):
             sources.append(
                 ChunkSource(
                     chunk_id=chunk.id,
-                    document_title=document.title,
+                    document_title=chunk.document_title,
                     content_preview=chunk.content[:200] + "..."
                     if len(chunk.content) > 200
                     else chunk.content,
                     similarity_rank=i + 1,
+                    similarity_score=round(score, 4),
                 )
             )
 
         logger.info(
             "rag_query_completed",
             question_length=len(question),
-            chunks_used=len(chunks),
+            chunks_used=len(scored_chunks),
             chunk_sources=sources,
             answer=llm_response.content,
             model=model,
@@ -133,8 +133,10 @@ class DocumentService:
         user_id: UUID,
     ) -> Document:
         """Process a document: chunk it, embed chunks, and store everything."""
-        # Step 1: Split into chunks
-        chunk_texts = self._splitter.split_text(content)
+        # Step 1: Split into chunks. create_documents (with add_start_index) yields
+        # each chunk's offset in the source, which we persist for citation mapping.
+        split_docs = self._splitter.create_documents([content])
+        chunk_texts = [doc.page_content for doc in split_docs]
         logger.info(
             "document_chunked",
             title=title,
@@ -157,13 +159,23 @@ class DocumentService:
 
         # Step 4: Create chunk records with embeddings
         chunks = []
-        for i, (text, embedding) in enumerate(zip(chunk_texts, embeddings, strict=True)):
+        for i, (doc, embedding) in enumerate(zip(split_docs, embeddings, strict=True)):
+            text = doc.page_content
+            # start_index is -1 if the splitter couldn't locate the chunk; treat
+            # that as "unknown" (None) rather than storing a bogus offset.
+            char_start = doc.metadata.get("start_index")
+            if char_start is not None and char_start < 0:
+                char_start = None
+            char_end = char_start + len(text) if char_start is not None else None
             chunk = await self._repository.create_chunk(
                 document_id=document.id,
+                document_title=document.title,
                 chunk_index=i,
                 content=text,
                 token_count=count_tokens(text),
                 embedding=embedding,
+                char_start=char_start,
+                char_end=char_end,
             )
             chunks.append(chunk)
 

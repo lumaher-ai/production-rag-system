@@ -82,10 +82,10 @@ Honest inventory. ✅ = implemented and running · ⚠️ = works but MVP-only �
 | Stage | Status | What's there now | The production gap |
 |---|:---:|---|---|
 | **Document ingestion** | ⚠️ | `POST /documents` — raw text via JSON | No file upload; no PDF/DOCX/HTML/Markdown loaders; no content hashing / idempotency |
-| **Chunking** | ⚠️ | One recursive splitter (1000 / 200) | Single fixed strategy; no token-based or structure-aware chunking; no per-chunk metadata |
+| **Chunking** | ⚠️ | One recursive splitter (1000 / 200); per-chunk char offsets captured | Single fixed strategy; no token-based or structure-aware chunking; `page`/`section` still pending loaders |
 | **Embedding** | ✅ | LiteLLM, `text-embedding-3-small`, 1536-d, batched, cost-logged | No embedding cache; dimension hardcoded to the model |
-| **Vector store** | ⚠️ | Postgres + pgvector, `Vector(1536)` | **No ANN index** — every query is an O(n) sequential scan |
-| **Retrieval** | ⚠️ | Dense cosine top-k, user-scoped | Vector-only; no hybrid/keyword, no metadata filters, no similarity score returned |
+| **Vector store** | ✅ | Postgres + pgvector, `Vector(1536)`, **HNSW index** (`vector_cosine_ops`) | Index params not yet tuned against eval metrics |
+| **Retrieval** | ⚠️ | Dense cosine top-k, user-scoped, **similarity scores returned** | Vector-only; no hybrid/keyword, no metadata filters |
 | **Reranking** | ❌ | — | No second-stage reranker or rank fusion |
 | **Generation** | ✅ | Grounded prompt, citations, cost tracking, provider fallback | No streaming; no citation-span mapping |
 | **Evaluation** | ❌ | — | No dataset, no retrieval/generation metrics, no regression gate |
@@ -221,10 +221,10 @@ Sequenced by production-signal-per-effort. The full file-level plan lives in **[
 
 These are tracked, not hidden — see the [roadmap](#-roadmap) and [technical report](docs/rag-production-roadmap.md):
 
-- **No vector index** → retrieval is O(n); fine for a demo corpus, unusable at scale.
 - **Text-only ingestion** → real documents are files; loaders are Phase 2.
-- **No evaluation** → retrieval and answer quality are currently unmeasured.
-- **Vector-only retrieval** → no keyword/hybrid recall, no reranking precision lift yet.
+- **Vector-only retrieval** → no keyword/hybrid recall, no reranking precision lift yet (Phase 3).
+- **No evaluation** → retrieval and answer quality are not yet measured; the eval harness is Phase 4.
+- **Denormalized chunk titles** → each chunk stores a copy of its document title for fast retrieval, so a future document-rename endpoint must also update those copies.
 
 ---
 

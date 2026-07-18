@@ -28,6 +28,10 @@ class ChunkSource(BaseModel):
     document_title: str
     content_preview: str
     similarity_rank: int
+    similarity_score: float = Field(
+        ...,
+        description="Cosine similarity to the query in [-1, 1]; 1.0 = identical. Higher is better.",
+    )
 
 
 class QueryResponse(BaseModel):
