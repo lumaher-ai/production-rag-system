@@ -66,6 +66,7 @@ async def upload_file(
         title=doc_title,
         segments=segments,
         user_id=current_user.id,
+        source=file.filename,
     )
     return DocumentResponse.model_validate(document)
 
@@ -80,6 +81,7 @@ async def query_documents(
         question=data.question,
         user_id=current_user.id,
         top_k=data.top_k,
+        filters=data.filters,
     )
 
 

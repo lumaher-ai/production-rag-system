@@ -1,3 +1,4 @@
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from sqlalchemy import select
@@ -5,6 +6,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from production_rag.exceptions import NotFoundError
 from production_rag.models.document import Document, DocumentChunk
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSessionTransaction
 
 
 class DocumentNotFoundError(NotFoundError):
@@ -14,6 +18,11 @@ class DocumentNotFoundError(NotFoundError):
 class DocumentRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
+
+    def savepoint(self) -> "AsyncSessionTransaction":
+        """A nested transaction (SAVEPOINT) so a unique-violation on one write can
+        be caught and recovered from without poisoning the outer transaction."""
+        return self._session.begin_nested()
 
     async def create_document(
         self,

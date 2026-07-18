@@ -68,8 +68,30 @@ class DocumentService:
         user_id: UUID,
         top_k: int = 5,
         model: str = "gpt-4.1-nano",
+        filters: dict[str, Any] | None = None,
     ) -> QueryResponse:
-        """Full RAG pipeline: embed query → search → build prompt → generate answer."""
+        """Full RAG pipeline: embed query → search → build prompt → generate answer.
+
+        Guarded by a deterministic cache: an identical (user, question, filters,
+        top_k, chunker version, embedding model) returns the stored answer without
+        embedding, retrieval, or an LLM call.
+        """
+        # Step 0: Cache lookup on the deterministic idempotency key.
+        cache_key = query_idempotency_key(
+            user_id=user_id,
+            question=question,
+            filters=filters,
+            top_k=top_k,
+            chunker_version=CHUNKER_VERSION,
+            embedding_model=self._embedding_service.model,
+        )
+        cached = await self._query_cache.get(cache_key)
+        if cached is not None:
+            logger.info("query_cache_hit", user_id=str(user_id), cache_key=cache_key)
+            response = QueryResponse.model_validate(cached.response_json)
+            response.cached = True
+            return response
+
         # Step 1: Embed the question (Retrieval)
         query_embedding = await self._embedding_service.embed_text(question)
 
@@ -131,7 +153,7 @@ class DocumentService:
             cost_usd=llm_response.cost_usd,
         )
 
-        return QueryResponse(
+        response = QueryResponse(
             answer=llm_response.content,
             sources=sources,
             model=llm_response.model,
@@ -140,17 +162,29 @@ class DocumentService:
             cost_usd=llm_response.cost_usd,
         )
 
+        # Persist to the deterministic cache (conditional write; TTL from config).
+        expires_at = datetime.now(timezone.utc) + timedelta(seconds=self._query_cache_ttl_seconds)
+        await self._query_cache.put(
+            idempotency_key=cache_key,
+            user_id=user_id,
+            response_json=response.model_dump(mode="json"),
+            expires_at=expires_at,
+        )
+        return response
+
     async def ingest_document(
         self,
         title: str,
         content: str,
         user_id: UUID,
+        source: str | None = "inline",
     ) -> Document:
         """Ingest a raw text document (JSON route). Delegates to the segment core."""
         return await self.ingest_segments(
             title=title,
             segments=[ExtractedSegment(text=content)],
             user_id=user_id,
+            source=source,
         )
 
     async def ingest_segments(
@@ -158,19 +192,39 @@ class DocumentService:
         title: str,
         segments: list[ExtractedSegment],
         user_id: UUID,
+        source: str | None = None,
     ) -> Document:
         """Chunk, embed, and store a document from structured segments.
 
-        Each segment is chunked independently so its ``page``/``section``
-        provenance carries onto every chunk it produces. char offsets are made
-        global against the joined ``full_content`` (what we persist as the
-        document body) so they stay valid for citation mapping.
+        Idempotent: if this exact content was already ingested by this user under
+        the current chunker + embedding model, the existing document is returned
+        and **no embedding happens**. Each segment is chunked independently so its
+        ``page``/``section`` provenance carries onto every chunk; char offsets are
+        made global against the joined ``full_content`` (the stored document body).
         """
         # Join with a fixed separator; SEP_LEN keeps the running offset aligned
         # with the stored full_content so char_start/char_end point into it.
         separator = "\n\n"
         sep_len = len(separator)
         full_content = separator.join(seg.text for seg in segments)
+
+        # Step 0: Idempotency short-circuit — skip re-embedding unchanged content.
+        chash = content_hash(full_content)
+        embedding_model = self._embedding_service.model
+        existing = await self._repository.get_document_by_idempotency(
+            user_id=user_id,
+            content_hash=chash,
+            chunker_version=CHUNKER_VERSION,
+            embedding_model=embedding_model,
+        )
+        if existing is not None:
+            logger.info(
+                "document_ingest_skipped",
+                document_id=str(existing.id),
+                title=title,
+                reason="content_hash_match",
+            )
+            return existing
 
         # Step 1: Chunk each segment, carrying its provenance and a global offset.
         chunk_texts: list[str] = []
@@ -211,13 +265,31 @@ class DocumentService:
         # Step 2: Embed all chunks in a single batch call
         embeddings = await self._embedding_service.embed_batch(chunk_texts)
 
-        # Step 3: Create document record
-        document = await self._repository.create_document(
-            title=title,
-            content=full_content,
-            user_id=user_id,
-            chunk_count=len(chunk_texts),
-        )
+        # Step 3: Create document record. A concurrent identical ingest may have
+        # raced us to the unique idempotency constraint — treat that as a hit.
+        try:
+            async with self._repository.savepoint():
+                document = await self._repository.create_document(
+                    title=title,
+                    content=full_content,
+                    user_id=user_id,
+                    chunk_count=len(chunk_texts),
+                    content_hash=chash,
+                    chunker_version=CHUNKER_VERSION,
+                    embedding_model=embedding_model,
+                    source=source,
+                )
+        except IntegrityError:
+            winner = await self._repository.get_document_by_idempotency(
+                user_id=user_id,
+                content_hash=chash,
+                chunker_version=CHUNKER_VERSION,
+                embedding_model=embedding_model,
+            )
+            if winner is None:
+                raise
+            logger.info("document_ingest_raced", document_id=str(winner.id), title=title)
+            return winner
 
         # Step 4: Create chunk records with embeddings and provenance
         chunks = []
@@ -226,6 +298,7 @@ class DocumentService:
         ):
             chunk = await self._repository.create_chunk(
                 document_id=document.id,
+                owner_id=user_id,
                 document_title=document.title,
                 chunk_index=i,
                 content=text,
@@ -237,6 +310,9 @@ class DocumentService:
                 section=meta["section"],
             )
             chunks.append(chunk)
+
+        # New content invalidates this user's cached answers (they may now be stale).
+        await self._query_cache.delete_by_user(user_id)
 
         logger.info(
             "document_ingested",

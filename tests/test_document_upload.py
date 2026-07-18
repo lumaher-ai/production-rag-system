@@ -19,6 +19,7 @@ def _mock_embedding_service() -> EmbeddingService:
     mock = AsyncMock(spec=EmbeddingService)
     mock.embed_text.side_effect = lambda text: [0.1] * 1536
     mock.embed_batch.side_effect = lambda texts: [[0.1] * 1536 for _ in texts]
+    mock.model = "text-embedding-3-small"  # part of the idempotency key
     return mock
 
 
