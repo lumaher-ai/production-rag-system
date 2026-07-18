@@ -49,6 +49,12 @@ class Settings(BaseSettings):
     jwt_expire_minutes: int = 30
     refresh_token_expire_days: int = 7
 
+    # Document uploads
+    max_upload_bytes: int = Field(
+        default=10_485_760,
+        description="Maximum accepted upload size in bytes (10 MiB)",
+    )
+
     openai_api_key: str = Field(default="", description="OpenAI API key")
     anthropic_api_key: str = Field(default="", description="Anthropic API key")
 

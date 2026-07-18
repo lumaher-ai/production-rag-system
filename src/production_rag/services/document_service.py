@@ -2,6 +2,7 @@ from uuid import UUID
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
+from production_rag.ingestion.loaders import ExtractedSegment
 from production_rag.llm.client import LLMClient, count_tokens
 from production_rag.llm.embedding_service import EmbeddingService
 from production_rag.logging_config import get_logger
@@ -132,15 +133,63 @@ class DocumentService:
         content: str,
         user_id: UUID,
     ) -> Document:
-        """Process a document: chunk it, embed chunks, and store everything."""
-        # Step 1: Split into chunks. create_documents (with add_start_index) yields
-        # each chunk's offset in the source, which we persist for citation mapping.
-        split_docs = self._splitter.create_documents([content])
-        chunk_texts = [doc.page_content for doc in split_docs]
+        """Ingest a raw text document (JSON route). Delegates to the segment core."""
+        return await self.ingest_segments(
+            title=title,
+            segments=[ExtractedSegment(text=content)],
+            user_id=user_id,
+        )
+
+    async def ingest_segments(
+        self,
+        title: str,
+        segments: list[ExtractedSegment],
+        user_id: UUID,
+    ) -> Document:
+        """Chunk, embed, and store a document from structured segments.
+
+        Each segment is chunked independently so its ``page``/``section``
+        provenance carries onto every chunk it produces. char offsets are made
+        global against the joined ``full_content`` (what we persist as the
+        document body) so they stay valid for citation mapping.
+        """
+        # Join with a fixed separator; SEP_LEN keeps the running offset aligned
+        # with the stored full_content so char_start/char_end point into it.
+        separator = "\n\n"
+        sep_len = len(separator)
+        full_content = separator.join(seg.text for seg in segments)
+
+        # Step 1: Chunk each segment, carrying its provenance and a global offset.
+        chunk_texts: list[str] = []
+        chunk_meta: list[dict] = []  # {char_start, char_end, page, section}
+        base_offset = 0
+        for seg in segments:
+            split_docs = self._splitter.create_documents([seg.text])
+            for doc in split_docs:
+                text = doc.page_content
+                # start_index is -1 if the splitter couldn't locate the chunk; treat
+                # that as "unknown" (None) rather than storing a bogus offset.
+                local_start = doc.metadata.get("start_index")
+                if local_start is not None and local_start < 0:
+                    local_start = None
+                char_start = base_offset + local_start if local_start is not None else None
+                char_end = char_start + len(text) if char_start is not None else None
+                chunk_texts.append(text)
+                chunk_meta.append(
+                    {
+                        "char_start": char_start,
+                        "char_end": char_end,
+                        "page": seg.page,
+                        "section": seg.section,
+                    }
+                )
+            base_offset += len(seg.text) + sep_len
+
         logger.info(
             "document_chunked",
             title=title,
-            total_chars=len(content),
+            total_chars=len(full_content),
+            segment_count=len(segments),
             chunk_count=len(chunk_texts),
             chunk_size=CHUNK_SIZE,
             chunk_overlap=CHUNK_OVERLAP,
@@ -152,21 +201,16 @@ class DocumentService:
         # Step 3: Create document record
         document = await self._repository.create_document(
             title=title,
-            content=content,
+            content=full_content,
             user_id=user_id,
             chunk_count=len(chunk_texts),
         )
 
-        # Step 4: Create chunk records with embeddings
+        # Step 4: Create chunk records with embeddings and provenance
         chunks = []
-        for i, (doc, embedding) in enumerate(zip(split_docs, embeddings, strict=True)):
-            text = doc.page_content
-            # start_index is -1 if the splitter couldn't locate the chunk; treat
-            # that as "unknown" (None) rather than storing a bogus offset.
-            char_start = doc.metadata.get("start_index")
-            if char_start is not None and char_start < 0:
-                char_start = None
-            char_end = char_start + len(text) if char_start is not None else None
+        for i, (text, meta, embedding) in enumerate(
+            zip(chunk_texts, chunk_meta, embeddings, strict=True)
+        ):
             chunk = await self._repository.create_chunk(
                 document_id=document.id,
                 document_title=document.title,
@@ -174,8 +218,10 @@ class DocumentService:
                 content=text,
                 token_count=count_tokens(text),
                 embedding=embedding,
-                char_start=char_start,
-                char_end=char_end,
+                char_start=meta["char_start"],
+                char_end=meta["char_end"],
+                page=meta["page"],
+                section=meta["section"],
             )
             chunks.append(chunk)
 
