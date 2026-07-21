@@ -5,11 +5,6 @@ from uuid import UUID
 from pydantic import BaseModel, Field
 
 
-class DocumentUploadRequest(BaseModel):
-    title: str = Field(..., min_length=1, max_length=255)
-    content: str = Field(..., min_length=10, max_length=500_000)
-
-
 class DocumentResponse(BaseModel):
     id: UUID
     title: str

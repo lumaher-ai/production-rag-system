@@ -9,31 +9,12 @@ from production_rag.ingestion.loaders import load_file
 from production_rag.models import User
 from production_rag.schemas.document import (
     DocumentResponse,
-    DocumentUploadRequest,
     QueryRequest,
     QueryResponse,
 )
 from production_rag.services.document_service import DocumentService
 
 router = APIRouter(prefix="/documents", tags=["documents"])
-
-
-@router.post(
-    "",
-    response_model=DocumentResponse,
-    status_code=status.HTTP_201_CREATED,
-)
-async def upload_document(
-    data: DocumentUploadRequest,
-    current_user: User = Depends(get_current_user),
-    service: DocumentService = Depends(get_document_service),
-) -> DocumentResponse:
-    document = await service.ingest_document(
-        title=data.title,
-        content=data.content,
-        user_id=current_user.id,
-    )
-    return DocumentResponse.model_validate(document)
 
 
 @router.post(
@@ -62,11 +43,15 @@ async def upload_file(
     stem = Path(file.filename).stem if file.filename else "document"
     doc_title = (title or stem or "document")[:255]
 
+    # source is the document's identity for (owner, source) replace-on-re-upload.
+    # Fall back to the title if the client omitted a filename.
+    source = (file.filename or doc_title)[:1024]
+
     document = await service.ingest_segments(
         title=doc_title,
         segments=segments,
         user_id=current_user.id,
-        source=file.filename,
+        source=source,
     )
     return DocumentResponse.model_validate(document)
 

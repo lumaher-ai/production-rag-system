@@ -113,7 +113,9 @@ async def test_identical_query_served_from_cache(pg_async_client: AsyncClient) -
     headers = {"Authorization": f"Bearer {token}"}
 
     await pg_async_client.post(
-        "/documents", json={"title": "KB", "content": "Python is great. " * 100}, headers=headers
+        "/documents/upload",
+        files={"file": ("kb.txt", b"Python is great. " * 100, "text/plain")},
+        headers=headers,
     )
     query = {"question": "What is Python?", "top_k": 3}
     r1 = await pg_async_client.post("/documents/query", json=query, headers=headers)
@@ -139,7 +141,9 @@ async def test_different_top_k_misses_cache(pg_async_client: AsyncClient) -> Non
     headers = {"Authorization": f"Bearer {token}"}
 
     await pg_async_client.post(
-        "/documents", json={"title": "KB", "content": "Rust is fast. " * 100}, headers=headers
+        "/documents/upload",
+        files={"file": ("kb.txt", b"Rust is fast. " * 100, "text/plain")},
+        headers=headers,
     )
     r1 = await pg_async_client.post(
         "/documents/query", json={"question": "What is Rust?", "top_k": 3}, headers=headers
@@ -165,7 +169,9 @@ async def test_ingest_invalidates_cache(pg_async_client: AsyncClient) -> None:
     headers = {"Authorization": f"Bearer {token}"}
 
     await pg_async_client.post(
-        "/documents", json={"title": "KB", "content": "Go is simple. " * 100}, headers=headers
+        "/documents/upload",
+        files={"file": ("kb.txt", b"Go is simple. " * 100, "text/plain")},
+        headers=headers,
     )
     query = {"question": "What is Go?", "top_k": 3}
     r1 = await pg_async_client.post("/documents/query", json=query, headers=headers)  # miss
@@ -174,8 +180,8 @@ async def test_ingest_invalidates_cache(pg_async_client: AsyncClient) -> None:
 
     # New ingestion invalidates the user's cached answers.
     await pg_async_client.post(
-        "/documents",
-        json={"title": "More", "content": "Go has goroutines. " * 100},
+        "/documents/upload",
+        files={"file": ("more.txt", b"Go has goroutines. " * 100, "text/plain")},
         headers=headers,
     )
     r3 = await pg_async_client.post("/documents/query", json=query, headers=headers)  # miss again

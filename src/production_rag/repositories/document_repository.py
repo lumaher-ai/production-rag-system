@@ -1,7 +1,7 @@
 from typing import TYPE_CHECKING
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from production_rag.exceptions import NotFoundError
@@ -33,7 +33,7 @@ class DocumentRepository:
         content_hash: str,
         chunker_version: str,
         embedding_model: str,
-        source: str | None = None,
+        source: str,
     ) -> Document:
         document = Document(
             title=title,
@@ -49,27 +49,54 @@ class DocumentRepository:
         await self._session.flush()
         return document
 
-    async def get_document_by_idempotency(
+    async def find_document_by_source(
         self,
         user_id: UUID,
-        content_hash: str,
-        chunker_version: str,
-        embedding_model: str,
+        source: str,
     ) -> Document | None:
-        """Return the document already ingested for this exact identity, if any.
+        """Return this user's existing document for ``source``, if any.
 
-        The identity mirrors the ``uq_documents_idempotency`` constraint so a
-        repeat ingest can short-circuit before any embedding work happens.
+        The identity mirrors the ``uq_documents_user_source`` constraint: at most
+        one row per (owner, source). Used to decide create vs. replace on upload.
         """
         result = await self._session.execute(
             select(Document).where(
                 Document.user_id == user_id,
-                Document.content_hash == content_hash,
-                Document.chunker_version == chunker_version,
-                Document.embedding_model == embedding_model,
+                Document.source == source,
             )
         )
         return result.scalar_one_or_none()
+
+    async def update_document_content(
+        self,
+        document: Document,
+        title: str,
+        content: str,
+        chunk_count: int,
+        content_hash: str,
+        chunker_version: str,
+        embedding_model: str,
+    ) -> Document:
+        """Rewrite an existing document's body/metadata in place (source is kept).
+
+        Callers replace the document's chunks separately via
+        ``delete_chunks_by_document_id`` + ``create_chunk``.
+        """
+        document.title = title
+        document.content = content
+        document.chunk_count = chunk_count
+        document.content_hash = content_hash
+        document.chunker_version = chunker_version
+        document.embedding_model = embedding_model
+        await self._session.flush()
+        return document
+
+    async def delete_chunks_by_document_id(self, document_id: UUID) -> None:
+        """Delete all chunks belonging to a document (used before re-chunking)."""
+        await self._session.execute(
+            delete(DocumentChunk).where(DocumentChunk.document_id == document_id)
+        )
+        await self._session.flush()
 
     async def create_chunk(
         self,

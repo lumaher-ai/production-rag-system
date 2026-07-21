@@ -11,17 +11,15 @@ from production_rag.database import Base
 class Document(Base):
     __tablename__ = "documents"
 
-    # Idempotency scope: the same content re-ingested by the same user under the
-    # same chunker + embedding model must not be re-embedded. This composite is
-    # the ingestion idempotency key, enforced in the DB so concurrent duplicate
-    # ingests collapse to one row (IntegrityError → return existing).
+    # Ingestion identity: one document per (owner, source). Re-uploading the same
+    # source replaces it in place — unchanged content is a no-op, edited content
+    # rewrites its chunks. Enforced in the DB so concurrent uploads of the same
+    # source collapse to one row (IntegrityError → return existing).
     __table_args__ = (
         UniqueConstraint(
             "user_id",
-            "content_hash",
-            "chunker_version",
-            "embedding_model",
-            name="uq_documents_idempotency",
+            "source",
+            name="uq_documents_user_source",
         ),
     )
 
@@ -33,14 +31,16 @@ class Document(Base):
         nullable=False,
     )
     chunk_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    # sha256 hex of `content` — the identity used to skip re-embedding.
+    # sha256 hex of `content` — used to detect whether a re-uploaded source is
+    # unchanged (no-op) or edited (rewrite chunks).
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-    # Config the embeddings were computed under; part of the idempotency key so a
-    # config change forces re-embedding rather than serving stale vectors.
+    # Config the embeddings were computed under; a change here forces a re-embed
+    # of an otherwise-unchanged source rather than serving stale vectors.
     chunker_version: Mapped[str] = mapped_column(String(64), nullable=False)
     embedding_model: Mapped[str] = mapped_column(String(128), nullable=False)
-    # Origin pointer (uploaded filename / URI; "inline" for the JSON route).
-    source: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    # Origin pointer (uploaded filename / URI). Part of the (user_id, source)
+    # identity, so every document must have one.
+    source: Mapped[str] = mapped_column(String(1024), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),

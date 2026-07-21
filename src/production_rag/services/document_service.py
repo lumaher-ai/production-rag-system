@@ -172,35 +172,27 @@ class DocumentService:
         )
         return response
 
-    async def ingest_document(
-        self,
-        title: str,
-        content: str,
-        user_id: UUID,
-        source: str | None = "inline",
-    ) -> Document:
-        """Ingest a raw text document (JSON route). Delegates to the segment core."""
-        return await self.ingest_segments(
-            title=title,
-            segments=[ExtractedSegment(text=content)],
-            user_id=user_id,
-            source=source,
-        )
-
     async def ingest_segments(
         self,
         title: str,
         segments: list[ExtractedSegment],
         user_id: UUID,
-        source: str | None = None,
+        source: str,
     ) -> Document:
         """Chunk, embed, and store a document from structured segments.
 
-        Idempotent: if this exact content was already ingested by this user under
-        the current chunker + embedding model, the existing document is returned
-        and **no embedding happens**. Each segment is chunked independently so its
-        ``page``/``section`` provenance carries onto every chunk; char offsets are
-        made global against the joined ``full_content`` (the stored document body).
+        Identity is ``(user_id, source)``. Re-uploading the same source:
+          - unchanged content (same hash + chunker + embedding model) → no-op,
+            the existing document is returned and **no embedding happens**;
+          - edited content → the existing document is replaced *in place*: its old
+            chunks are deleted and new ones written, its body/hash updated, all in
+            the request's single transaction (a crash mid-way rolls back to the
+            old version). The document id is preserved.
+        A source not seen before is created fresh.
+
+        Each segment is chunked independently so its ``page``/``section``
+        provenance carries onto every chunk; char offsets are made global against
+        the joined ``full_content`` (the stored document body).
         """
         # Join with a fixed separator; SEP_LEN keeps the running offset aligned
         # with the stored full_content so char_start/char_end point into it.
@@ -208,21 +200,25 @@ class DocumentService:
         sep_len = len(separator)
         full_content = separator.join(seg.text for seg in segments)
 
-        # Step 0: Idempotency short-circuit — skip re-embedding unchanged content.
+        # Step 0: Locate any existing document for this source. Unchanged content
+        # under the same chunker + embedding model short-circuits before any
+        # embedding work; otherwise we fall through to (re)build its chunks.
         chash = content_hash(full_content)
         embedding_model = self._embedding_service.model
-        existing = await self._repository.get_document_by_idempotency(
+        existing = await self._repository.find_document_by_source(
             user_id=user_id,
-            content_hash=chash,
-            chunker_version=CHUNKER_VERSION,
-            embedding_model=embedding_model,
+            source=source,
         )
-        if existing is not None:
+        if existing is not None and (
+            existing.content_hash == chash
+            and existing.chunker_version == CHUNKER_VERSION
+            and existing.embedding_model == embedding_model
+        ):
             logger.info(
                 "document_ingest_skipped",
                 document_id=str(existing.id),
                 title=title,
-                reason="content_hash_match",
+                reason="unchanged_source",
             )
             return existing
 
@@ -265,31 +261,47 @@ class DocumentService:
         # Step 2: Embed all chunks in a single batch call
         embeddings = await self._embedding_service.embed_batch(chunk_texts)
 
-        # Step 3: Create document record. A concurrent identical ingest may have
-        # raced us to the unique idempotency constraint — treat that as a hit.
-        try:
-            async with self._repository.savepoint():
-                document = await self._repository.create_document(
-                    title=title,
-                    content=full_content,
-                    user_id=user_id,
-                    chunk_count=len(chunk_texts),
-                    content_hash=chash,
-                    chunker_version=CHUNKER_VERSION,
-                    embedding_model=embedding_model,
-                    source=source,
-                )
-        except IntegrityError:
-            winner = await self._repository.get_document_by_idempotency(
-                user_id=user_id,
+        # Step 3: Persist the document. Either replace the existing source in place
+        # (drop its old chunks, update its body/hash) or create a fresh row. Both
+        # run inside the request's single transaction, so a failure before commit
+        # rolls back to the previous version — an edited re-upload never leaves the
+        # document half-rewritten.
+        if existing is not None:
+            await self._repository.delete_chunks_by_document_id(existing.id)
+            document = await self._repository.update_document_content(
+                document=existing,
+                title=title,
+                content=full_content,
+                chunk_count=len(chunk_texts),
                 content_hash=chash,
                 chunker_version=CHUNKER_VERSION,
                 embedding_model=embedding_model,
             )
-            if winner is None:
-                raise
-            logger.info("document_ingest_raced", document_id=str(winner.id), title=title)
-            return winner
+            logger.info("document_replaced", document_id=str(document.id), title=title)
+        else:
+            # A concurrent upload of the same source may have raced us to the
+            # unique (user_id, source) constraint — treat that as a hit.
+            try:
+                async with self._repository.savepoint():
+                    document = await self._repository.create_document(
+                        title=title,
+                        content=full_content,
+                        user_id=user_id,
+                        chunk_count=len(chunk_texts),
+                        content_hash=chash,
+                        chunker_version=CHUNKER_VERSION,
+                        embedding_model=embedding_model,
+                        source=source,
+                    )
+            except IntegrityError:
+                winner = await self._repository.find_document_by_source(
+                    user_id=user_id,
+                    source=source,
+                )
+                if winner is None:
+                    raise
+                logger.info("document_ingest_raced", document_id=str(winner.id), title=title)
+                return winner
 
         # Step 4: Create chunk records with embeddings and provenance
         chunks = []
