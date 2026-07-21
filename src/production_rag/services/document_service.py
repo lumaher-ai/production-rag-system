@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID
@@ -10,12 +11,27 @@ from production_rag.ingestion.loaders import ExtractedSegment
 from production_rag.llm.client import LLMClient, count_tokens
 from production_rag.llm.embedding_service import EmbeddingService
 from production_rag.logging_config import get_logger
-from production_rag.models.document import Document
+from production_rag.models.document import Document, DocumentChunk
 from production_rag.repositories.document_repository import DocumentRepository
 from production_rag.repositories.query_cache_repository import QueryCacheRepository
 from production_rag.schemas.document import ChunkSource, QueryResponse
 
 logger = get_logger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class ScoredChunk:
+    """A retrieved chunk paired with its relevance score.
+
+    ``score`` is cosine *similarity* in ``[-1, 1]`` (``1.0`` = identical
+    direction), i.e. ``1 - cosine_distance`` — **higher is a better match**. It
+    is a similarity, NOT a distance; ranking is by *descending* score. This is
+    the field eval harnesses rank on for Recall@k / nDCG, so its orientation
+    matters: reading it as a distance would silently invert those metrics.
+    """
+
+    chunk: DocumentChunk
+    score: float
 
 # Chunking config
 CHUNK_SIZE = 1000
@@ -62,6 +78,36 @@ class DocumentService:
             add_start_index=True,  # record each chunk's offset in the source (for citations)
         )
 
+    async def retrieve(
+        self,
+        question: str,
+        user_id: UUID,
+        top_k: int = 5,
+        filters: dict[str, Any] | None = None,
+        use_cache: bool = True,
+    ) -> list[ScoredChunk]:
+        """Retrieval only: embed the question and return the top-k most similar
+        chunks with their similarity scores. **No LLM, no synthesis.**
+
+        This is the stage evals measure (Recall@k / nDCG) — cheap and fast, and
+        the exact code path ``query()`` runs, so measuring it here doesn't lie
+        about production. Retrieval itself is never cached (the answer cache
+        lives in ``query()``), so calling this always exercises real embedding +
+        vector search. ``use_cache`` is accepted so callers express intent
+        uniformly; an eval harness passes ``use_cache=False`` to guarantee it is
+        measuring retrieval and never a warm answer cache. ``filters`` is
+        reserved for forward-compat (not yet applied at the retrieval layer).
+        """
+        # Embed the question, then rank chunks by cosine similarity (higher is
+        # better). search_similar_chunks already returns (chunk, similarity).
+        query_embedding = await self._embedding_service.embed_text(question)
+        scored = await self._repository.search_similar_chunks(
+            query_embedding=query_embedding,
+            user_id=user_id,
+            top_k=top_k,
+        )
+        return [ScoredChunk(chunk=chunk, score=score) for chunk, score in scored]
+
     async def query(
         self,
         question: str,
@@ -69,14 +115,18 @@ class DocumentService:
         top_k: int = 5,
         model: str = "gpt-4.1-nano",
         filters: dict[str, Any] | None = None,
+        use_cache: bool = True,
     ) -> QueryResponse:
-        """Full RAG pipeline: embed query → search → build prompt → generate answer.
+        """Full RAG pipeline: ``retrieve()`` then synthesize an answer.
 
-        Guarded by a deterministic cache: an identical (user, question, filters,
-        top_k, chunker version, embedding model) returns the stored answer without
-        embedding, retrieval, or an LLM call.
+        Retrieval is delegated to ``retrieve()`` (the same path evals measure);
+        this method adds only prompt-building + generation on top. Guarded by a
+        deterministic answer cache (skipped when ``use_cache=False``): an
+        identical (user, question, filters, top_k, chunker version, embedding
+        model) returns the stored answer without embedding, retrieval, or an
+        LLM call.
         """
-        # Step 0: Cache lookup on the deterministic idempotency key.
+        # Step 0: Answer-cache lookup on the deterministic idempotency key.
         cache_key = query_idempotency_key(
             user_id=user_id,
             question=question,
@@ -85,21 +135,21 @@ class DocumentService:
             chunker_version=CHUNKER_VERSION,
             embedding_model=self._embedding_service.model,
         )
-        cached = await self._query_cache.get(cache_key)
-        if cached is not None:
-            logger.info("query_cache_hit", user_id=str(user_id), cache_key=cache_key)
-            response = QueryResponse.model_validate(cached.response_json)
-            response.cached = True
-            return response
+        if use_cache:
+            cached = await self._query_cache.get(cache_key)
+            if cached is not None:
+                logger.info("query_cache_hit", user_id=str(user_id), cache_key=cache_key)
+                response = QueryResponse.model_validate(cached.response_json)
+                response.cached = True
+                return response
 
-        # Step 1: Embed the question (Retrieval)
-        query_embedding = await self._embedding_service.embed_text(question)
-
-        # Step 2: Find similar chunks (Retrieval) — each paired with its similarity score
-        scored_chunks = await self._repository.search_similar_chunks(
-            query_embedding=query_embedding,
+        # Step 1: Retrieve (embed + vector search) — the eval-measurable stage.
+        scored_chunks = await self.retrieve(
+            question=question,
             user_id=user_id,
             top_k=top_k,
+            filters=filters,
+            use_cache=use_cache,
         )
 
         if not scored_chunks:
@@ -112,13 +162,15 @@ class DocumentService:
                 cost_usd=0.0,
             )
 
-        # Step 3: Build context from chunks (Augmented)
+        # Step 2: Build context from chunks (Augmented)
         context_parts = []
-        for i, (chunk, _score) in enumerate(scored_chunks):
-            context_parts.append(f"[Source {i + 1}: {chunk.document_title}]\n{chunk.content}")
+        for i, sc in enumerate(scored_chunks):
+            context_parts.append(
+                f"[Source {i + 1}: {sc.chunk.document_title}]\n{sc.chunk.content}"
+            )
         context = "\n\n---\n\n".join(context_parts)
 
-        # Step 4: Call LLM with context (Generation)
+        # Step 3: Call LLM with context (Generation)
         system_prompt = RAG_SYSTEM_PROMPT.format(context=context)
         llm_response = await self._llm.chat(
             messages=[{"role": "user", "content": question}],
@@ -126,9 +178,10 @@ class DocumentService:
             model=model,
         )
 
-        # Step 5: Build response with sources (Generation)
+        # Step 4: Build response with sources (Generation)
         sources = []
-        for i, (chunk, score) in enumerate(scored_chunks):
+        for i, sc in enumerate(scored_chunks):
+            chunk = sc.chunk
             sources.append(
                 ChunkSource(
                     chunk_id=chunk.id,
@@ -137,7 +190,7 @@ class DocumentService:
                     if len(chunk.content) > 200
                     else chunk.content,
                     similarity_rank=i + 1,
-                    similarity_score=round(score, 4),
+                    similarity_score=round(sc.score, 4),
                 )
             )
 
@@ -162,14 +215,18 @@ class DocumentService:
             cost_usd=llm_response.cost_usd,
         )
 
-        # Persist to the deterministic cache (conditional write; TTL from config).
-        expires_at = datetime.now(timezone.utc) + timedelta(seconds=self._query_cache_ttl_seconds)
-        await self._query_cache.put(
-            idempotency_key=cache_key,
-            user_id=user_id,
-            response_json=response.model_dump(mode="json"),
-            expires_at=expires_at,
-        )
+        # Persist to the deterministic answer cache (conditional write; TTL from
+        # config). Skipped when caching is disabled so evals never populate it.
+        if use_cache:
+            expires_at = datetime.now(timezone.utc) + timedelta(
+                seconds=self._query_cache_ttl_seconds
+            )
+            await self._query_cache.put(
+                idempotency_key=cache_key,
+                user_id=user_id,
+                response_json=response.model_dump(mode="json"),
+                expires_at=expires_at,
+            )
         return response
 
     async def ingest_segments(
