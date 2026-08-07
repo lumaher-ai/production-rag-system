@@ -7,6 +7,11 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from production_rag.ingestion.idempotency import query_idempotency_key
 from production_rag.ingestion.loaders import ExtractedSegment
+from production_rag.ingestion.normalize import (
+    NORMALIZER_VERSION,
+    normalize_segments,
+    normalize_text,
+)
 from production_rag.llm.client import LLMClient
 from production_rag.llm.embedding_service import EmbeddingService
 from production_rag.logging_config import get_logger
@@ -81,18 +86,26 @@ def build_splitter() -> RecursiveCharacterTextSplitter:
 
 
 def build_chunks(segments: list[ExtractedSegment]) -> tuple[str, list[PreparedChunk]]:
-    """Split segments into chunks. Pure, deterministic, and side-effect free.
+    """Normalize, then split into chunks. Pure, deterministic, side-effect free.
 
-    Returns the joined document body and its chunks. Each segment is chunked
-    independently so its ``page``/``section`` provenance carries onto every
-    chunk; char offsets are made global against the joined body, which is what
-    gets stored as ``Document.content``.
+    Returns the normalized document body and its chunks. Each segment is
+    normalized and chunked independently so its ``page``/``section`` provenance
+    carries onto every chunk; char offsets are made global against the joined
+    body, which is what gets stored as ``Document.content``.
+
+    **Normalization is inside this function, not a step callers perform first.**
+    That is the same principle ``ingestion.idempotency`` applies to version
+    inputs: a caller must have no way to skip it. Chunking un-normalized text
+    would embed ligatures and stray whitespace as tokens, and — worse — would
+    produce chunks whose offsets point into a differently-shaped string than the
+    one stored as ``Document.content``.
 
     **Determinism is a correctness requirement, not a nicety.** A worker
     resuming a partly-done job re-runs this function and skips the first
     ``processed_chunks`` entries; if the output differed between attempts, the
     document would end up with a mixture of two chunkings.
     """
+    segments = normalize_segments(segments)
     sep_len = len(SEGMENT_SEPARATOR)
     full_content = SEGMENT_SEPARATOR.join(seg.text for seg in segments)
 
@@ -172,6 +185,13 @@ class DocumentService:
         measuring retrieval and never a warm answer cache. ``filters`` is
         reserved for forward-compat (not yet applied at the retrieval layer).
         """
+        # Normalize the question under the SAME rules the corpus was normalized
+        # with. Skipping this leaves an asymmetry that never raises an error and
+        # only shows up as quietly worse recall: the corpus has been NFKC-folded,
+        # so a question containing a ligature or a non-breaking space would be
+        # embedded against text that no longer contains those characters.
+        question = normalize_text(question)
+
         # Embed the question, then rank chunks by cosine similarity (higher is
         # better). search_similar_chunks already returns (chunk, similarity).
         query_embedding = await self._embedding_service.embed_text(question)
@@ -206,6 +226,7 @@ class DocumentService:
             question=question,
             filters=filters,
             top_k=top_k,
+            normalizer_version=NORMALIZER_VERSION,
             chunker_version=CHUNKER_VERSION,
             embedding_model=self._embedding_service.model,
         )

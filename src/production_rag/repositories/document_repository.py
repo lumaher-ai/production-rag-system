@@ -1,7 +1,7 @@
 from typing import TYPE_CHECKING
 from uuid import UUID
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from production_rag.exceptions import NotFoundError
@@ -31,6 +31,7 @@ class DocumentRepository:
         user_id: UUID,
         chunk_count: int,
         content_hash: str,
+        normalizer_version: str,
         chunker_version: str,
         embedding_model: str,
         source: str,
@@ -41,6 +42,7 @@ class DocumentRepository:
             user_id=user_id,
             chunk_count=chunk_count,
             content_hash=content_hash,
+            normalizer_version=normalizer_version,
             chunker_version=chunker_version,
             embedding_model=embedding_model,
             source=source,
@@ -74,6 +76,7 @@ class DocumentRepository:
         content: str,
         chunk_count: int,
         content_hash: str,
+        normalizer_version: str,
         chunker_version: str,
         embedding_model: str,
     ) -> Document:
@@ -86,6 +89,7 @@ class DocumentRepository:
         document.content = content
         document.chunk_count = chunk_count
         document.content_hash = content_hash
+        document.normalizer_version = normalizer_version
         document.chunker_version = chunker_version
         document.embedding_model = embedding_model
         await self._session.flush()
@@ -160,6 +164,59 @@ class DocumentRepository:
             .limit(top_k)
         )
         return [(row[0], 1.0 - row.distance) for row in result.all()]
+
+    async def document_has_provenance(self, document_id: UUID) -> bool:
+        """Whether any of this document's chunks carry page or section values.
+
+        Used before a re-index falls back to the stored body, so the warning can
+        say whether provenance is actually being lost or whether there was none
+        to lose — the difference between a real caveat and noise.
+        """
+        result = await self._session.execute(
+            select(DocumentChunk.id)
+            .where(
+                DocumentChunk.document_id == document_id,
+                or_(
+                    DocumentChunk.page.is_not(None),
+                    DocumentChunk.section.is_not(None),
+                ),
+            )
+            .limit(1)
+        )
+        return result.scalar_one_or_none() is not None
+
+    async def find_stale(
+        self,
+        normalizer_version: str,
+        chunker_version: str,
+        embedding_model: str,
+        limit: int = 500,
+    ) -> list[Document]:
+        """Documents whose stored vectors were produced under superseded config.
+
+        These three columns are the silent inputs to every stored vector, so a
+        row differing on any of them holds embeddings that no longer match how
+        the system would process the same text today. They stay queryable and
+        retrievable — nothing is broken — but they are inconsistent with newer
+        documents in a way that only this comparison can reveal.
+
+        This is what the version columns buy that a content hash cannot: the
+        question "which documents predate the fix?" is an indexed lookup here,
+        rather than re-normalizing the whole corpus and diffing hashes.
+        """
+        result = await self._session.execute(
+            select(Document)
+            .where(
+                or_(
+                    Document.normalizer_version != normalizer_version,
+                    Document.chunker_version != chunker_version,
+                    Document.embedding_model != embedding_model,
+                )
+            )
+            .order_by(Document.created_at)
+            .limit(limit)
+        )
+        return list(result.scalars().all())
 
     async def list_documents_by_user(
         self,

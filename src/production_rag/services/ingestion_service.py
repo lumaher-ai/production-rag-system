@@ -29,6 +29,7 @@ from production_rag.exceptions import ValidationError
 from production_rag.ingestion.connectors import fetch_source
 from production_rag.ingestion.idempotency import content_hash
 from production_rag.ingestion.loaders import ExtractedSegment, load_file
+from production_rag.ingestion.normalize import NORMALIZER_VERSION
 from production_rag.ingestion.sources import parse_source_uri
 from production_rag.llm.client import count_tokens
 from production_rag.llm.embedding_service import EmbeddingService
@@ -80,15 +81,22 @@ class IngestionService:
 
         await self._jobs.mark_running(job)
 
-        # Resume is only valid if the chunker has not moved since the completed
-        # work was produced; otherwise the cursor points into a different chunk
-        # list and would splice two chunkings together.
-        if job.processed_chunks > 0 and job.chunker_version != CHUNKER_VERSION:
+        # Resume is only valid if neither the normalizer nor the chunker has
+        # moved since the completed work was produced. Either change makes the
+        # cursor point into a different chunk list, and resuming would splice two
+        # incompatible processings into one document — with nothing downstream
+        # able to detect it.
+        if job.processed_chunks > 0 and (
+            job.chunker_version != CHUNKER_VERSION
+            or job.normalizer_version != NORMALIZER_VERSION
+        ):
             logger.warning(
-                "ingestion_job_chunker_changed",
+                "ingestion_job_config_changed",
                 job_id=str(job.id),
-                was=job.chunker_version,
-                now=CHUNKER_VERSION,
+                was_chunker=job.chunker_version,
+                now_chunker=CHUNKER_VERSION,
+                was_normalizer=job.normalizer_version,
+                now_normalizer=NORMALIZER_VERSION,
                 discarded_chunks=job.processed_chunks,
             )
             await self._jobs.reset_progress(job)
@@ -141,6 +149,22 @@ class IngestionService:
         Returns the filename alongside the segments: for a URI source it is
         discovered by the fetch (from Content-Disposition or the URL path) and
         is not knowable when the job is created.
+
+        Three sources of bytes, in preference order:
+
+          1. **staged payload** — a job still holding its uploaded bytes;
+          2. **a fetchable URI** (``https://``, ``gdrive://``) — re-fetched, so
+             the loader runs again and **page/section provenance is preserved**;
+          3. **the stored document body** — the re-index fallback.
+
+        Branch 3 exists because a re-index of an ``upload://`` document reaches
+        neither of the first two: its payload was cleared when the original job
+        succeeded, and ``upload://`` is deliberately not fetchable (it names
+        bytes that only ever arrived over multipart). **Its cost is real and is
+        logged per document**: ``Document.content`` is the *joined* segment text,
+        so re-chunking it recovers no ``page``/``section`` values — those columns
+        come back NULL. Documents with structure worth keeping should be
+        re-uploaded rather than re-indexed through this path.
         """
         if job.payload is not None:
             content = job.payload
@@ -148,12 +172,50 @@ class IngestionService:
             content_type = job.content_type
         else:
             parsed = parse_source_uri(job.source)
-            fetched = await fetch_source(parsed, settings)
-            content = fetched.content
-            filename = fetched.filename
-            content_type = fetched.content_type
+            if parsed.is_fetchable:
+                fetched = await fetch_source(parsed, settings)
+                content = fetched.content
+                filename = fetched.filename
+                content_type = fetched.content_type
+            else:
+                return await self._segments_from_stored_body(job)
 
         return load_file(content, filename, content_type), filename
+
+    async def _segments_from_stored_body(
+        self, job: IngestionJob
+    ) -> tuple[list[ExtractedSegment], str | None]:
+        """Rebuild segments from the persisted document body (re-index only).
+
+        The body survives as ``Document.content``, so a document can be
+        re-processed under new normalization/chunking rules without asking the
+        user to re-upload. What does not survive is structure: the stored body is
+        segments already joined, so this returns a single section-less,
+        page-less segment and the rebuilt chunks lose that provenance.
+        """
+        existing = await self._documents.find_document_by_source(
+            user_id=job.user_id, source=job.source
+        )
+        if existing is None:
+            raise ValidationError(
+                f"Cannot re-index '{job.source}': its bytes are not staged, the "
+                f"source is not fetchable, and no stored document body exists."
+            )
+
+        had_structure = await self._documents.document_has_provenance(existing.id)
+        logger.warning(
+            "ingestion_reindex_from_stored_body",
+            document_id=str(existing.id),
+            source=job.source,
+            provenance_lost=had_structure,
+            detail=(
+                "page/section provenance cannot be recovered from the stored body; "
+                "re-upload the original file to restore it"
+                if had_structure
+                else "document had no page/section provenance to lose"
+            ),
+        )
+        return [ExtractedSegment(text=existing.content)], existing.title
 
     async def _persist(
         self,
@@ -182,6 +244,7 @@ class IngestionService:
             not resuming
             and existing is not None
             and existing.content_hash == chash
+            and existing.normalizer_version == NORMALIZER_VERSION
             and existing.chunker_version == CHUNKER_VERSION
             and existing.embedding_model == embedding_model
         ):
@@ -192,7 +255,7 @@ class IngestionService:
                 reason="unchanged_source",
             )
             if job is not None and self._jobs is not None:
-                await self._jobs.set_plan(job, len(chunks), CHUNKER_VERSION)
+                await self._jobs.set_plan(job, len(chunks), NORMALIZER_VERSION, CHUNKER_VERSION)
                 await self._jobs.advance(job, len(chunks))
                 await self._jobs.mark_succeeded(job, existing.id)
             return existing
@@ -222,7 +285,7 @@ class IngestionService:
             )
 
         if job is not None and self._jobs is not None:
-            await self._jobs.set_plan(job, len(chunks), CHUNKER_VERSION)
+            await self._jobs.set_plan(job, len(chunks), NORMALIZER_VERSION, CHUNKER_VERSION)
 
         await self._embed_and_store(
             document=document,
@@ -270,6 +333,7 @@ class IngestionService:
                 content=full_content,
                 chunk_count=chunk_count,
                 content_hash=chash,
+                normalizer_version=NORMALIZER_VERSION,
                 chunker_version=CHUNKER_VERSION,
                 embedding_model=embedding_model,
             )
@@ -286,6 +350,7 @@ class IngestionService:
                     user_id=user_id,
                     chunk_count=chunk_count,
                     content_hash=chash,
+                    normalizer_version=NORMALIZER_VERSION,
                     chunker_version=CHUNKER_VERSION,
                     embedding_model=embedding_model,
                     source=source,

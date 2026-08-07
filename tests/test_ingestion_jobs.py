@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from production_rag.config import get_settings
 from production_rag.ingestion.loaders import ExtractedSegment
+from production_rag.ingestion.normalize import NORMALIZER_VERSION
 from production_rag.llm.embedding_service import EmbeddingService
 from production_rag.models import User
 from production_rag.models.document import Document, DocumentChunk
@@ -27,8 +28,9 @@ from production_rag.repositories.ingestion_job_repository import (
     IngestionJobRepository,
 )
 from production_rag.repositories.query_cache_repository import QueryCacheRepository
+from production_rag.services import ingestion_service
 from production_rag.services.auth_service import hash_password
-from production_rag.services.document_service import build_chunks
+from production_rag.services.document_service import CHUNKER_VERSION, build_chunks
 from production_rag.services.ingestion_service import IngestionService
 
 pytestmark = pytest.mark.asyncio(loop_scope="module")
@@ -609,3 +611,161 @@ async def test_recovered_job_resumes_rather_than_restarting(
     embedded = sum(len(c.args[0]) for c in retry_embeddings.embed_batch.call_args_list)
     assert embedded == job.total_chunks - orphaned_at
     assert await _count_chunks(pg_session, document.id) == job.total_chunks
+
+
+# ─── Normalizer versioning: the gate this decision exists to close ───
+
+
+async def test_stale_normalizer_forces_reembedding(
+    pg_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A normalizer change must NOT be served from vectors computed under the old rules.
+
+    This is the exact failure the version exists to prevent: identical bytes, an
+    idempotency gate that reports "unchanged", and stored embeddings produced by
+    normalization rules that no longer apply. Nothing downstream would raise —
+    the vectors would simply mean something slightly different from every
+    document ingested after the change.
+    """
+    user = await _make_user(pg_session, "stale-normalizer@example.com")
+    jobs = IngestionJobRepository(pg_session)
+    source = f"upload://{user.id}/norm.txt"
+
+    first = await jobs.create(
+        user_id=user.id,
+        source=source,
+        payload=LONG_TEXT.encode(),
+        filename="norm.txt",
+        content_type="text/plain",
+    )
+    document = await _service(pg_session, _mock_embeddings()).run_job(first, get_settings())
+    assert document is not None
+    assert document.normalizer_version == NORMALIZER_VERSION
+
+    # Same bytes, but the rules moved underneath us.
+    monkeypatch.setattr(ingestion_service, "NORMALIZER_VERSION", "nfkc-ws-v2-hypothetical")
+    second_embeddings = _mock_embeddings()
+    second = await jobs.create(
+        user_id=user.id,
+        source=source,
+        payload=LONG_TEXT.encode(),
+        filename="norm.txt",
+        content_type="text/plain",
+    )
+    await _service(pg_session, second_embeddings).run_job(second, get_settings())
+
+    # The gate refused to short-circuit: it re-embedded rather than serving
+    # vectors built under the superseded normalizer.
+    assert second_embeddings.embed_batch.called
+    refreshed = await pg_session.get(Document, document.id)
+    assert refreshed is not None
+    assert refreshed.normalizer_version == "nfkc-ws-v2-hypothetical"
+
+
+async def test_unchanged_normalizer_still_short_circuits(pg_session: AsyncSession) -> None:
+    """The converse — the new gate must not make every re-ingest a re-embed."""
+    user = await _make_user(pg_session, "same-normalizer@example.com")
+    jobs = IngestionJobRepository(pg_session)
+    source = f"upload://{user.id}/same-norm.txt"
+
+    first = await jobs.create(
+        user_id=user.id, source=source, payload=LONG_TEXT.encode(),
+        filename="same-norm.txt", content_type="text/plain",
+    )
+    await _service(pg_session, _mock_embeddings()).run_job(first, get_settings())
+
+    second_embeddings = _mock_embeddings()
+    second = await jobs.create(
+        user_id=user.id, source=source, payload=LONG_TEXT.encode(),
+        filename="same-norm.txt", content_type="text/plain",
+    )
+    await _service(pg_session, second_embeddings).run_job(second, get_settings())
+
+    second_embeddings.embed_batch.assert_not_called()
+
+
+async def test_normalizer_change_mid_job_restarts_instead_of_splicing(
+    pg_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Resuming across a normalizer change would interleave two normalizations."""
+    user = await _make_user(pg_session, "norm-resume@example.com")
+    jobs = IngestionJobRepository(pg_session)
+    job = await jobs.create(
+        user_id=user.id,
+        source=f"upload://{user.id}/nr.txt",
+        payload=LONG_TEXT.encode(),
+        filename="nr.txt",
+        content_type="text/plain",
+    )
+    # Progress recorded under a normalizer that no longer exists.
+    job.processed_chunks = 15
+    job.chunker_version = CHUNKER_VERSION
+    job.normalizer_version = "nfkc-ws-v0-ancient"
+    await pg_session.commit()
+
+    document = await _service(pg_session, _mock_embeddings(), batch_size=10).run_job(
+        job, get_settings()
+    )
+
+    assert document is not None
+    assert job.normalizer_version == NORMALIZER_VERSION
+    # Rebuilt in full rather than continued from the stale cursor.
+    assert await _count_chunks(pg_session, document.id) == job.total_chunks
+
+
+async def test_ingested_text_is_normalized_in_storage(pg_session: AsyncSession) -> None:
+    """Chunks and the stored body hold normalized text, not loader output."""
+    user = await _make_user(pg_session, "normalized-body@example.com")
+    jobs = IngestionJobRepository(pg_session)
+    raw = ("The ﬁle   describes\r\nﬂow control.\n\n\n\n\nMore text here. " * 20).encode()
+
+    job = await jobs.create(
+        user_id=user.id,
+        source=f"upload://{user.id}/lig.txt",
+        payload=raw,
+        filename="lig.txt",
+        content_type="text/plain",
+    )
+    document = await _service(pg_session, _mock_embeddings()).run_job(job, get_settings())
+
+    assert document is not None
+    assert "ﬁ" not in document.content and "ﬂ" not in document.content
+    assert "file" in document.content and "flow" in document.content
+    assert "\r" not in document.content
+    assert "\n\n\n" not in document.content  # blank runs capped
+
+    rows = await pg_session.execute(
+        select(DocumentChunk.content).where(DocumentChunk.document_id == document.id)
+    )
+    contents = [r[0] for r in rows.all()]
+    assert all("ﬁ" not in c and "\r" not in c for c in contents)
+
+
+async def test_char_offsets_point_into_the_stored_body(pg_session: AsyncSession) -> None:
+    """Normalizing before chunking keeps provenance offsets truthful.
+
+    char_start/char_end index into Document.content. If chunking ran on
+    un-normalized text while the normalized body was stored, every offset would
+    silently address the wrong span.
+    """
+    user = await _make_user(pg_session, "offsets@example.com")
+    jobs = IngestionJobRepository(pg_session)
+    job = await jobs.create(
+        user_id=user.id,
+        source=f"upload://{user.id}/off.txt",
+        payload=("The ﬁle   has\r\nirregular  spacing. " * 60).encode(),
+        filename="off.txt",
+        content_type="text/plain",
+    )
+    document = await _service(pg_session, _mock_embeddings()).run_job(job, get_settings())
+    assert document is not None
+
+    rows = await pg_session.execute(
+        select(DocumentChunk.content, DocumentChunk.char_start, DocumentChunk.char_end)
+        .where(DocumentChunk.document_id == document.id)
+        .order_by(DocumentChunk.chunk_index)
+    )
+    located = [(c, s, e) for c, s, e in rows.all() if s is not None]
+    assert located, "expected at least one chunk with recorded offsets"
+    for content, start, end in located:
+        assert document.content[start:end] == content

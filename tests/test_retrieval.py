@@ -8,9 +8,9 @@ from production_rag.llm.client import LLMClient
 from production_rag.llm.embedding_service import EmbeddingService
 from production_rag.models import User
 from production_rag.repositories.document_repository import DocumentRepository
+from production_rag.repositories.ingestion_job_repository import IngestionJobRepository
 from production_rag.repositories.query_cache_repository import QueryCacheRepository
 from production_rag.services.auth_service import hash_password
-from production_rag.repositories.ingestion_job_repository import IngestionJobRepository
 from production_rag.services.document_service import DocumentService, ScoredChunk
 from production_rag.services.ingestion_service import IngestionService
 
@@ -83,3 +83,49 @@ async def test_retrieve_returns_scored_chunks_without_llm(pg_session: AsyncSessi
     assert scores == sorted(scores, reverse=True)
     # Retrieval synthesises nothing: the LLM was never called.
     service._llm.chat.assert_not_called()
+
+
+async def test_query_is_normalized_to_match_the_corpus(pg_session: AsyncSession) -> None:
+    """A ligature in the question must reach text stored as plain ASCII.
+
+    Documents are NFKC-folded at ingestion. Without normalizing the question
+    under the same rules, a query containing 'ﬁ' would be embedded against a
+    corpus that no longer contains that character — an asymmetry that raises no
+    error and only shows up as quietly worse recall.
+    """
+    emb = _mock_embedding_service()
+    service = _service(pg_session, emb)
+
+    user = User(
+        name="N",
+        email="normquery@example.com",
+        hashed_password=hash_password("pw"),
+        role="user",
+    )
+    pg_session.add(user)
+    await pg_session.flush()
+
+    await IngestionService(
+        document_repository=DocumentRepository(pg_session),
+        embedding_service=emb,
+        query_cache_repository=QueryCacheRepository(pg_session),
+        job_repository=IngestionJobRepository(pg_session),
+    ).ingest_now(
+        title="Ligatures",
+        segments=[ExtractedSegment(text="The file describes flow control. " * 40)],
+        user_id=user.id,
+        source=f"upload://{user.id}/lig.txt",
+    )
+
+    await service.retrieve(
+        question="How does the ﬁle describe ﬂow control?",
+        user_id=user.id,
+        top_k=3,
+        use_cache=False,
+    )
+
+    # The text handed to the embedder carries no ligatures — same rules as the
+    # corpus, so both sides of the comparison are in the same representation.
+    embedded = emb.embed_text.call_args.args[0]
+    assert "ﬁ" not in embedded and "ﬂ" not in embedded
+    assert "file" in embedded and "flow" in embedded

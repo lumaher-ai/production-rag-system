@@ -138,10 +138,20 @@ class IngestionJobRepository:
         return job
 
     async def set_plan(
-        self, job: IngestionJob, total_chunks: int, chunker_version: str
+        self,
+        job: IngestionJob,
+        total_chunks: int,
+        normalizer_version: str,
+        chunker_version: str,
     ) -> IngestionJob:
-        """Record the chunk count and the chunker it was derived under."""
+        """Record the chunk count and the config it was derived under.
+
+        Both versions are stored because either one moving invalidates the
+        resume cursor — the chunk list a retry derives would not line up with
+        the chunks already written.
+        """
         job.total_chunks = total_chunks
+        job.normalizer_version = normalizer_version
         job.chunker_version = chunker_version
         await self._session.commit()
         return job

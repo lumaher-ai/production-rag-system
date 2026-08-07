@@ -34,8 +34,19 @@ class Document(Base):
     # sha256 hex of `content` — used to detect whether a re-uploaded source is
     # unchanged (no-op) or edited (rewrite chunks).
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-    # Config the embeddings were computed under; a change here forces a re-embed
-    # of an otherwise-unchanged source rather than serving stale vectors.
+    # Config the embeddings were computed under; a change to any of these forces
+    # a re-embed of an otherwise-unchanged source rather than serving stale
+    # vectors. Together they are the complete set of *silent inputs* to a stored
+    # vector — change one and the vectors mean something different while the
+    # source text looks identical.
+    #
+    # ``normalizer_version`` is 'none' for rows ingested before normalization
+    # existed. That value is deliberately chosen never to match a real version,
+    # so those rows fail the gate and are re-processed rather than being
+    # mistaken for current.
+    normalizer_version: Mapped[str] = mapped_column(
+        String(64), nullable=False, server_default="none"
+    )
     chunker_version: Mapped[str] = mapped_column(String(64), nullable=False)
     embedding_model: Mapped[str] = mapped_column(String(128), nullable=False)
     # Origin pointer (uploaded filename / URI). Part of the (user_id, source)

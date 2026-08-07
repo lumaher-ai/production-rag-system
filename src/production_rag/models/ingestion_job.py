@@ -62,9 +62,11 @@ class IngestionJob(Base):
     # (content, chunker_version), so a retry re-derives the same chunk list and
     # skips this many. That is why resuming needs no persisted chunk text.
     processed_chunks: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    # The chunker the completed work was produced under. If it changes between
-    # attempts the cursor is meaningless — resuming would splice two chunkings
-    # together — so the worker restarts the job from zero instead.
+    # The normalizer and chunker the completed work was produced under. If either
+    # changes between attempts the cursor is meaningless — resuming would splice
+    # two different normalizations or chunkings into one document — so the worker
+    # restarts the job from zero instead.
+    normalizer_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
     chunker_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     # ─── Outcome ───
