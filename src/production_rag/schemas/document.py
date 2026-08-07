@@ -10,8 +10,31 @@ class DocumentResponse(BaseModel):
     title: str
     chunk_count: int
     created_at: datetime
+    source: str = Field(
+        ...,
+        description="Canonical source URI — the document's identity together with "
+        "its owner. e.g. upload://<user_id>/report.pdf, https://…, gdrive://<file_id>. "
+        "Re-ingesting the same source replaces this document rather than duplicating it.",
+    )
 
     model_config = {"from_attributes": True}
+
+
+class IngestFromUriRequest(BaseModel):
+    uri: str = Field(
+        ...,
+        min_length=1,
+        max_length=1024,
+        description="Source URI to pull from: https://…, http://… (only when "
+        "explicitly enabled), or gdrive://<file_id>. upload:// is not fetchable — "
+        "use POST /documents/upload for direct file uploads.",
+        examples=["https://example.com/report.pdf", "gdrive://1A2b3C4d5E6f7G8h9I"],
+    )
+    title: str | None = Field(
+        default=None,
+        max_length=255,
+        description="Overrides the title derived from the fetched filename.",
+    )
 
 
 class QueryRequest(BaseModel):

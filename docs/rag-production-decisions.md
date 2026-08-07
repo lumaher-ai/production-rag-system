@@ -62,16 +62,52 @@ What remains is: retrieval quality (Part E), the measurement layer that would ju
 
 ### A1. What are the authoritative sources, and how does content enter?
 
-- **State:** ⚠️
-- **Now:** One path — an authenticated user uploads a file or posts JSON. No connectors, no crawl,
-  no scheduled pull. `source` is a free-text string (the filename).
-- **Options:** (a) user-upload only; (b) + URL/web ingestion; (c) + object-store sync (S3/GDrive);
-  (d) + CDC/event-driven from a system of record.
-- **Call:** Stay at (a) and **say so explicitly** as a scope boundary, but make `source` a real URI
-  (`upload://<user>/<filename>`, `s3://…`, `https://…`) now. Retrofitting an identity scheme after
-  a second connector exists is a migration; choosing the shape today is free.
-- **Proof:** N/A — this is a scope declaration, not a measurement. Its correctness shows up as the
-  absence of a painful migration later.
+- **State:** ✅ **DECIDED & IMPLEMENTED (2026-08-07)** — upload + URL + Google Drive, one-shot pull,
+  app-level credentials, `source` as a real URI.
+- **Was:** One path — an authenticated user uploaded a file. `source` was a free-text bare filename.
+- **Decision taken:** (a) + (b) + partial (c). Scope went past this report's original
+  recommendation, deliberately: the connector interface is only proven by a second and third
+  implementation, and the URI scheme is only load-bearing once more than one scheme exists.
+  - **`upload://<user_id>/<filename>`** — minted server-side by `build_upload_uri`. The authority
+    is the owner's **UUID, not their name**: `User.name` is mutable and non-unique and `User.email`
+    is mutable PII, so either would change the source string on a rename and silently break
+    `(user_id, source)` identity — the next upload of an unchanged file would duplicate rather than
+    replace. Filenames are percent-encoded with `safe=""`, so `a/b.pdf` cannot forge path structure.
+  - **`https://…`** via `HttpConnector` — redirects followed **by hand** so every hop is
+    SSRF-checked (see below), response streamed against `max_upload_bytes`, plaintext `http://`
+    refused unless explicitly enabled.
+  - **`gdrive://<file_id>`** via `GoogleDriveConnector` — app-level service account. Google-native
+    Docs are **exported as HTML**, not plaintext, so `HtmlLoader` recovers heading structure and the
+    file keeps its `section` provenance; Slides export as text; other Google types are refused with
+    a specific message rather than a generic failure.
+  - **`s3://` deliberately not shipped.** It parses as a known-but-unsupported scheme and returns a
+    422 naming what *is* supported, rather than a confusing 500.
+- **Credentials: app-level, from `Settings`.** Every user's pull runs as the same server identity,
+  so the system reaches only what the server can see. Per-user OAuth would need a token table,
+  encryption at rest, and a consent flow — a scope boundary, stated rather than implied.
+- **Sync: one-shot pull.** `POST /documents/ingest` fetches now and returns; re-syncing means
+  calling again, which is cheap because the existing content-hash gate short-circuits unchanged
+  content before any embedding spend. Scheduled/CDC sync stays blocked on **A2** (async ingestion) —
+  polling on a synchronous request path would be the wrong foundation.
+- **Security — this endpoint is an SSRF surface.** An authenticated caller naming an arbitrary URL
+  makes the server fetch it and hands back the body as a document. `_assert_public_address` resolves
+  the host and rejects private, loopback, link-local, reserved, multicast, and unspecified
+  addresses — checking **every** A record, and re-checking **each redirect hop**, since automatic
+  redirect-following would validate only the caller's original URL. The residual DNS-rebinding
+  window is documented in the code rather than papered over. `allow_private_network_sources` exists
+  solely so tests and local development can fetch loopback, and says so in its own description.
+- **Migration:** `a1f7c2e94b31` deletes existing documents (chunks cascade) and clears `query_cache`.
+  Pre-URI rows hold bare filenames that the new upload path cannot match, so they would duplicate on
+  re-upload. With no production data, a clean reset is more honest than backfilling rows nobody
+  depends on. `downgrade()` is a documented no-op — deleted data does not come back.
+- **Proof:** 48 tests. The load-bearing ones: a re-ingest of the same URI returns the *same document
+  id* with one row in the table; an upload and a URL fetch of the same filename stay *distinct*
+  documents (the scheme is doing real work); six private-address forms are refused end-to-end
+  through the route with a 502; percent-encoded and over-long filenames still round-trip through
+  `parse_source_uri`.
+- **Follow-ups this opened:** the `source` column is now structured data with an unenforced shape
+  (a CHECK constraint or a parse-on-load validator would close that); and `A2` matters more now,
+  since a URL fetch adds unbounded network time to an already-synchronous ingest transaction.
 
 ### A2. Is ingestion synchronous with the request, or queued?
 

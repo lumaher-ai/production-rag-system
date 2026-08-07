@@ -49,6 +49,9 @@ async def test_upload_txt_returns_201(pg_async_client: AsyncClient) -> None:
     data = response.json()
     assert data["title"] == "notes"  # filename stem
     assert data["chunk_count"] > 0
+    # source is a URI, not the bare filename: scheme + owner + filename.
+    assert data["source"].startswith("upload://")
+    assert data["source"].endswith("/notes.txt")
 
     app.dependency_overrides.pop(get_embedding_service, None)
 

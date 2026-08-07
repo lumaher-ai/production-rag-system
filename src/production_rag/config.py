@@ -1,7 +1,51 @@
 from functools import lru_cache
+from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Repository root, derived from this file's location
+# (<root>/src/production_rag/config.py). Used to resolve relative file paths in
+# configuration so they do not depend on the process's working directory.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+def resolve_config_path(value: str) -> str:
+    """Turn a configured file path into an absolute one, CWD-independently.
+
+    A relative path in ``.env`` (``secrets/key.json``) silently means different
+    files depending on where the process was launched from — it resolves under
+    `uvicorn` started in the repo root, then fails under Docker, systemd, or a
+    test runner with a different working directory, surfacing as a confusing
+    "not configured" error rather than "wrong path".
+
+    Resolution order, first hit wins:
+      1. already absolute (``~`` expanded) — used as given;
+      2. relative to the current working directory — preserves the behaviour of
+         any existing deployment that relies on it;
+      3. relative to the project root — what a developer writing
+         ``secrets/key.json`` in ``.env`` actually means.
+
+    If none exist, the CWD-relative absolute path is returned so the resulting
+    error message names a concrete location instead of a bare relative string.
+    Empty stays empty: that is "not configured", which is a valid state.
+    """
+    if not value:
+        return value
+
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return str(path)
+
+    from_cwd = (Path.cwd() / path).resolve()
+    if from_cwd.is_file():
+        return str(from_cwd)
+
+    from_root = (PROJECT_ROOT / path).resolve()
+    if from_root.is_file():
+        return str(from_root)
+
+    return str(from_cwd)
 
 
 class Settings(BaseSettings):
@@ -51,9 +95,57 @@ class Settings(BaseSettings):
 
     # Document uploads
     max_upload_bytes: int = Field(
-        default=10_485_760,
-        description="Maximum accepted upload size in bytes (10 MiB)",
+        default=104_857_600,
+        description="Maximum accepted document size in bytes (100 MiB). Caps both "
+        "multipart uploads and connector fetches, so every ingestion path shares "
+        "one limit. Sized for image-heavy PDFs: a 384-page book measured at 91 MiB "
+        "on disk but only ~250K characters of extractable text, so the byte size "
+        "of a PDF says little about its embedding cost.",
     )
+
+    # Source connectors (ingest-by-URI)
+    source_fetch_timeout_seconds: float = Field(
+        default=120.0,
+        description="Per-operation timeout when a connector fetches a source URI. "
+        "httpx applies this between reads rather than to the whole transfer, but "
+        "it is sized against measured throughput: a 91 MiB Drive PDF took ~21s on "
+        "a fast connection, so a slow link needs real headroom.",
+    )
+    source_fetch_max_redirects: int = Field(
+        default=5,
+        description="Maximum redirect hops followed when fetching an http(s) source. "
+        "Each hop is re-checked against the SSRF guard.",
+    )
+    allow_insecure_http_sources: bool = Field(
+        default=False,
+        description="Allow ingesting plaintext http:// URLs. Off by default; "
+        "intended for local development only.",
+    )
+    allow_private_network_sources: bool = Field(
+        default=False,
+        description="Disable the SSRF guard that blocks fetches resolving to "
+        "private/loopback/link-local addresses. NEVER enable in production — it "
+        "exposes cloud metadata endpoints and internal services. Exists so tests "
+        "and local development can fetch from localhost.",
+    )
+    google_service_account_file: str = Field(
+        default="",
+        description="Path to a Google service-account JSON key with read access "
+        "to the Drive files to ingest. Relative paths resolve against the project "
+        "root, so they work regardless of the process's working directory. "
+        "Empty disables the gdrive:// connector.",
+    )
+
+    @field_validator("google_service_account_file")
+    @classmethod
+    def _resolve_service_account_path(cls, value: str) -> str:
+        """Normalize to an absolute path at load time.
+
+        Done here rather than at the call site so every consumer — connector,
+        health check, CLI — sees the same resolved path, and so the value shown
+        in an error message is the location actually probed.
+        """
+        return resolve_config_path(value)
 
     # Ingestion / retrieval
     embedding_model: str = Field(
