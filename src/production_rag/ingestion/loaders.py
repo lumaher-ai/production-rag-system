@@ -162,6 +162,26 @@ EXTENSION_TO_MIME: dict[str, str] = {
 }
 
 
+def resolve_mime(filename: str | None, content_type: str | None) -> str | None:
+    """Canonical MIME for a file, or ``None`` if neither signal identifies one.
+
+    The extension wins over the declared ``content_type`` — see the note on
+    ``EXTENSION_TO_MIME`` — and the declared type is normalized before lookup so
+    ``text/plain; charset=utf-8`` matches ``text/plain``.
+
+    Split out from ``resolve_loader`` because the answer is useful on its own:
+    it is stored as ``metadata.mime_type``, where "which format was this" is a
+    fact worth filtering on even though the loader that consumed it is not.
+    """
+    ext = Path(filename).suffix.lower() if filename else ""
+    mime = EXTENSION_TO_MIME.get(ext)
+    if mime is not None:
+        return mime
+    if content_type:
+        return content_type.split(";")[0].strip().lower()  # drop '; charset=...'
+    return None
+
+
 def resolve_loader(filename: str | None, content_type: str | None) -> FileLoader | None:
     """Pick a loader for a file, or ``None`` if the format is unsupported.
 
@@ -169,14 +189,8 @@ def resolve_loader(filename: str | None, content_type: str | None) -> FileLoader
     queueing a job — a synchronous 415 is far more useful than a job that fails
     a second later with the same message.
     """
-    ext = Path(filename).suffix.lower() if filename else ""
-    mime = EXTENSION_TO_MIME.get(ext)
-    if mime is not None:
-        return LOADER_REGISTRY.get(mime)
-    if content_type:
-        normalized = content_type.split(";")[0].strip().lower()  # drop '; charset=...'
-        return LOADER_REGISTRY.get(normalized)
-    return None
+    mime = resolve_mime(filename, content_type)
+    return LOADER_REGISTRY.get(mime) if mime is not None else None
 
 
 def load_file(

@@ -160,10 +160,13 @@ def get_document_service(
     llm_client: LLMClient = Depends(get_llm_client),
     query_cache_repository: QueryCacheRepository = Depends(get_query_cache_repository),
 ) -> DocumentService:
+    settings = get_settings()
     return DocumentService(
         repository=repository,
         embedding_service=embedding_service,
         llm_client=llm_client,
         query_cache_repository=query_cache_repository,
-        query_cache_ttl_seconds=get_settings().query_cache_ttl_seconds,
+        query_cache_ttl_seconds=settings.query_cache_ttl_seconds,
+        hnsw_ef_search=settings.hnsw_ef_search,
+        hnsw_iterative_scan=settings.hnsw_iterative_scan,
     )

@@ -186,6 +186,25 @@ class Settings(BaseSettings):
         default=3600,
         description="Time-to-live for cached query answers (seconds)",
     )
+    hnsw_ef_search: int = Field(
+        default=100,
+        description=(
+            "Candidate-list size for HNSW queries (pgvector default is 40). Higher "
+            "trades latency for recall; matters most when retrieval is filtered, "
+            "since filtered-out rows still consume the candidate list. 0 leaves the "
+            "server default in place."
+        ),
+    )
+    hnsw_iterative_scan: str = Field(
+        default="relaxed_order",
+        description=(
+            "pgvector iterative scan mode: 'relaxed_order', 'strict_order', or 'off'. "
+            "Without it an HNSW scan applies WHERE *after* walking the graph and can "
+            "return fewer rows than LIMIT with no error — the filtered-ANN under-return "
+            "bug. Requires pgvector >= 0.8; on older servers the setting is skipped "
+            "with a warning. Empty string disables setting it at all."
+        ),
+    )
 
     openai_api_key: str = Field(default="", description="OpenAI API key")
     anthropic_api_key: str = Field(default="", description="Anthropic API key")

@@ -10,6 +10,7 @@ from production_rag.dependencies import get_embedding_service
 from production_rag.llm.embedding_service import EmbeddingService
 from production_rag.main import app
 from production_rag.models.document import Document, DocumentChunk
+from production_rag.services import ingestion_service
 from tests._jobs import drain_jobs
 
 pytestmark = pytest.mark.asyncio(loop_scope="module")
@@ -83,6 +84,48 @@ async def test_reupload_same_source_unchanged_skips_embedding(
     assert r1["id"] == r2["id"]
     assert r1["chunk_count"] == r2["chunk_count"]
     assert mock_emb.embed_batch.call_count == 1
+
+    app.dependency_overrides.pop(get_embedding_service, None)
+
+
+async def test_unchanged_reingest_does_not_re_extract_metadata(
+    pg_async_client: AsyncClient,
+    pg_session: AsyncSession,
+    job_queue,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The no-op path must not pay for work it will not use.
+
+    This ordering is invisible from the outside: extracting *before* the
+    idempotency gate produces byte-identical metadata and passes every other
+    test in this file, so a regression here breaks nothing and reports nothing.
+    It is pinned because the cost is not fixed. Extraction is cheap today; an
+    extractor that ever called a model would bill a request on every re-ingest
+    that decided to do nothing, and the code would still look correct.
+    """
+    calls: list[str] = []
+    real_extract = ingestion_service.extract_metadata
+
+    def counting_extract(text: str, **kwargs: object) -> dict:
+        calls.append(text[:32])
+        return real_extract(text, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(ingestion_service, "extract_metadata", counting_extract)
+
+    mock_emb = _mock_embedding_service()
+    app.dependency_overrides[get_embedding_service] = lambda: mock_emb
+    token = await _auth_token(pg_async_client, "extract-once@example.com")
+    content = b"stable body uploaded twice, unchanged. " * 50
+
+    await _upload(
+        pg_async_client, token, "stable.txt", content, pg_session, job_queue, mock_emb
+    )
+    assert len(calls) == 1, "the first ingest must extract"
+
+    await _upload(
+        pg_async_client, token, "stable.txt", content, pg_session, job_queue, mock_emb
+    )
+    assert len(calls) == 1, "an unchanged re-ingest must not extract again"
 
     app.dependency_overrides.pop(get_embedding_service, None)
 

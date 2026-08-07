@@ -7,6 +7,8 @@ job ids, so those tests exercise the same code path production does rather than
 a synchronous shortcut kept alive for their benefit.
 """
 
+import hashlib
+import random
 from unittest.mock import AsyncMock
 from uuid import UUID
 
@@ -26,10 +28,43 @@ EMBEDDING_DIMS = 1536
 
 
 def mock_embedding_service(model: str = "text-embedding-3-small") -> EmbeddingService:
-    """A deterministic stand-in — the model name is part of the idempotency key."""
+    """A deterministic stand-in — the model name is part of the idempotency key.
+
+    Every text maps to the *same* vector, which is fine for ingestion tests (they
+    assert on rows written, not on ranking) and useless for retrieval tests: with
+    all chunks equidistant, any ordering assertion passes vacuously. Those want
+    ``hashed_embedding_service`` below.
+    """
     mock = AsyncMock(spec=EmbeddingService)
     mock.embed_text.side_effect = lambda text: [0.1] * EMBEDDING_DIMS
     mock.embed_batch.side_effect = lambda texts: [[0.1] * EMBEDDING_DIMS for _ in texts]
+    mock.model = model
+    return mock
+
+
+def embed_deterministically(text: str) -> list[float]:
+    """A stable pseudo-random unit vector derived from ``text``.
+
+    Distinct texts get distinct directions and identical texts get identical
+    ones, so a query embedded from a chunk's own text is that chunk's nearest
+    neighbour at distance ~0. That is what makes rank and recall assertions mean
+    something without calling a real embedding API.
+
+    Seeded from a content hash rather than the global RNG so the vectors do not
+    depend on test ordering.
+    """
+    seed = int.from_bytes(hashlib.sha256(text.encode("utf-8")).digest()[:8], "big")
+    rng = random.Random(seed)
+    vector = [rng.gauss(0.0, 1.0) for _ in range(EMBEDDING_DIMS)]
+    norm = sum(value * value for value in vector) ** 0.5
+    return [value / norm for value in vector]
+
+
+def hashed_embedding_service(model: str = "text-embedding-3-small") -> EmbeddingService:
+    """An embedding stand-in whose vectors actually distinguish texts."""
+    mock = AsyncMock(spec=EmbeddingService)
+    mock.embed_text.side_effect = embed_deterministically
+    mock.embed_batch.side_effect = lambda texts: [embed_deterministically(t) for t in texts]
     mock.model = model
     return mock
 

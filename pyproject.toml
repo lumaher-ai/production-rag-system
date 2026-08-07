@@ -19,6 +19,7 @@ dependencies = [
     "langchain-core>=1.3.2",
     "langchain-litellm>=0.6.4",
     "langchain-text-splitters>=1.1.2",
+    "langdetect>=1.0.9",
     "langgraph>=1.1.10",
     "langgraph-checkpoint-postgres>=3.0.5",
     "litellm>=1.83.0",
@@ -51,6 +52,12 @@ dependencies = [
 [tool.pytest.ini_options]
     asyncio_mode = "auto"
     testpaths = ["tests"]
+
+# These two ship without type stubs or a py.typed marker. Silencing them here
+# keeps a real type error visible instead of buried in import noise.
+[[tool.mypy.overrides]]
+    module = ["langdetect.*", "pgvector.*"]
+    ignore_missing_imports = true
 [dependency-groups]
 dev = [
     "aiosqlite>=0.22.1",

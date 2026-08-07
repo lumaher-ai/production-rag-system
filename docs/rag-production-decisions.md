@@ -227,17 +227,44 @@ reasons the hash cannot cover:
 
 ### A4. What metadata is attached to a chunk, and where does it come from?
 
-- **State:** ⚠️
-- **Now:** Structural only — `page`, `section`, `char_start/end`, `document_title`, `owner_id`.
+- **State:** ✅ — extractive metadata in a JSONB column, GIN-indexed.
+- **Was:** Structural only — `page`, `section`, `char_start/end`, `document_title`, `owner_id`.
   Good provenance; **zero semantic or governance metadata.** No document type, date, author,
   language, entities, sensitivity/classification label.
 - **Options:** (a) structural only; (b) + extractive (regex/heuristic: dates, doc type, language);
   (c) + model-derived (NER, classification, topic); (d) + LLM-generated summaries/keywords per chunk.
-- **Call:** **(b) now, and add a `metadata JSONB` column** rather than more typed columns — you do
-  not yet know which fields matter, and JSONB + a GIN index lets filtering evolve without a
-  migration per field. Defer (c)/(d) until a filter or eval failure demands them.
-- **Proof:** This is enabling infrastructure. Its payoff is measured in E4 (filtering) and H8
-  (governance) — a chunk-level ACL is impossible without it.
+- **Call:** **(b), in a `metadata JSONB` column** rather than more typed columns — which fields
+  matter is not yet known, and JSONB + a GIN index lets filtering evolve without a migration per
+  field. (c)/(d) stay deferred until a filter or eval failure demands them.
+- **Now:** `ingestion/metadata.py` extracts `language` (langdetect, seed-pinned), `document_date`
+  (regex; ISO + Spanish/English long forms), `doc_type` (weighted bilingual markers → `contract`,
+  `invoice`, `resume`, `report`, `policy`, `email`, `manual`, or `other`) and `mime_type`, into
+  `metadata JSONB` on both `documents` and `document_chunks`. The chunk copy is denormalized for
+  the same reason `owner_id` and `document_title` are: the ANN query filters without a join.
+
+**Three things that turned out to matter more than the column itself:**
+
+1. **Absent, not null.** Extractors return `None` rather than guessing, and null keys are *omitted*
+   from the stored document. Containment distinguishes the two — `metadata @> '{"language": null}'`
+   matches a stored null but not an absent key — so storing nulls would build a filter that matches
+   documents precisely because detection failed on them. The same logic makes rows that predate
+   extraction (`{}`) correctly invisible to every filter: unknown is not "matches".
+2. **The detector needed guards on both sides.** langdetect only raises on input with *no* features;
+   given a column of part numbers it answers, confidently, `hr` at p=0.86. So an input guard
+   (alphabetic ratio ≥ 0.5) and an output guard (top probability ≥ 0.90) sit around it. Real prose
+   in any script clears both at ~0.9999; reference tables clear neither.
+3. **`METADATA_VERSION` is deliberately NOT in the idempotency gate**, unlike `normalizer_version` /
+   `chunker_version` / `embedding_model`. Those three are silent inputs to a stored *vector*.
+   Extracted metadata never reaches the embedding model, so gating on it would turn adding one
+   keyword to a marker list into a full-corpus re-embed. Unchanged content whose `extractor_version`
+   has moved gets its metadata refreshed in place instead — two UPDATEs, no embedding spend. The
+   version travels *inside* the JSONB, so "which rows predate the current extractor?" is
+   `WHERE metadata->>'extractor_version' IS DISTINCT FROM 'extractive-v1'` — no migration, which is
+   the whole argument for the column restated as a query.
+
+- **Proof:** `tests/test_metadata_extraction.py` — determinism, absent-not-guessed, and the
+  ambiguity refusals (`03/04/2024` is unparseable without a locale, so it is not parsed). Its real
+  payoff is measured in E4 (filtering) and H8 (governance).
 
 ### A5. What is a document's identity, and what does re-ingestion mean?
 
@@ -453,11 +480,12 @@ reasons the hash cannot cover:
 
 ### D3. How is recall tuned at query time, and does filtering break it?
 
-- **State:** ❌ — **the most technically interesting live gap in the system.**
-- **Now:** `hnsw.ef_search` is never set, so every query runs at pgvector's default of 40. More
-  importantly: retrieval is `WHERE owner_id = :user AND ORDER BY embedding <=> :q LIMIT k`. In
-  pgvector, an HNSW scan walks the graph and **then** the filter is applied — so if the graph's
-  first ~`ef_search` hits belong to other users, this query **returns fewer than `top_k` rows, or
+- **State:** ⚠️ — mitigated, **not yet proven**. The fix is deployed; the experiment that would
+  demonstrate it works is still outstanding, and that gap is the honest state of this decision.
+- **Was:** `hnsw.ef_search` was never set, so every query ran at pgvector's default of 40. More
+  importantly: retrieval was `WHERE owner_id = :user AND ORDER BY embedding <=> :q LIMIT k`. In
+  pgvector, an HNSW scan walks the graph and **then** applies the filter — so if the graph's
+  first ~`ef_search` hits belong to other users, the query **returns fewer than `top_k` rows, or
   none at all**, while reporting perfect success. Recall silently collapses as the number of users
   grows. This is a multi-tenant correctness bug wearing the costume of a tuning parameter.
 - **Options:** (a) raise `ef_search` per session (mitigates, never eliminates); (b) **partial
@@ -468,12 +496,39 @@ reasons the hash cannot cover:
   satisfied); (e) move to a store with native filtered ANN.
 - **Call:** **(d) now** — a one-line session setting that makes the filter correct, available in the
   installed pgvector. **(c) as the scale answer**, since it also gives clean tenant isolation (H8)
-  and cheap per-tenant deletion. Set `ef_search` explicitly per query (start at 100) regardless, so
-  the recall/latency trade is a decision rather than a default.
-- **Proof:** With N synthetic tenants sharing an index, measure returned-row count and Recall@10 for
-  one tenant's queries as N grows — with and without the fix. **This single experiment is a better
-  senior-engineer signal than any other item in this report**, because it demonstrates you found a
-  correctness bug that only appears under production conditions and that no unit test would catch.
+  and cheap per-tenant deletion. `ef_search` set explicitly per query regardless, so the
+  recall/latency trade is a decision rather than a default.
+- **Now:** `DocumentRepository._apply_ann_settings` emits `SET LOCAL hnsw.ef_search` (default 100,
+  `Settings.hnsw_ef_search`) and `SET LOCAL hnsw.iterative_scan = 'relaxed_order'`
+  (`Settings.hnsw_iterative_scan`) before every ANN query. `SET LOCAL` dies with the request's
+  transaction, so a pooled connection never carries them into unrelated work. Each statement runs
+  in its own savepoint: a server without the GUC (pgvector < 0.8) logs a warning and degrades
+  instead of failing. Because `relaxed_order` returns rows in approximate distance order, the query
+  is wrapped and re-sorted outside the scan — `ScoredChunk.score` is what an eval harness ranks on,
+  so its ordering cannot be left approximate.
+
+**Two things this fix taught, both worth more than the fix:**
+
+1. **A soft-failing `SET` is its own hazard.** The first implementation wrote
+   `SET LOCAL hnsw.ef_search = :ef` — a syntax error, because `SET` takes a literal and never a
+   bind parameter. Since unsupported settings are *designed* to log and continue, the malformed one
+   degraded identically: no error, no failed test, recall quietly back to unmitigated. It was found
+   by instrumenting a run, not by the suite. `test_the_hnsw_recall_settings_are_actually_in_force`
+   now reads the settings back from the server after a real search.
+2. **The HNSW index did not exist under test.** The fixtures build their schema with
+   `Base.metadata.create_all`, not Alembic, so an index declared only in a migration was absent —
+   every test query was an exact sequential scan, the one condition under which this bug *cannot*
+   reproduce. The index is now declared in `DocumentChunk.__table_args__` as well as its migration.
+
+- **Proof — still owed.** The suite verifies the mitigating settings are applied and that a filtered
+  query returns a full page, but **at test corpus size the query returns a full page with iterative
+  scan disabled too** — so it is a regression guard, not a reproduction. Reproducing the collapse
+  needs the walk to miss `ef_search` candidates repeatedly, which takes tens of thousands of
+  vectors. The real proof is unchanged: with N synthetic tenants sharing an index, measure
+  returned-row count and Recall@10 for one tenant as N grows, with and without the fix. **That
+  single experiment is still a better senior-engineer signal than any other item in this report** —
+  shipping the mitigation does not retire it, and E4's metadata predicates make it more urgent, not
+  less, since every added predicate narrows what the graph walk can return.
 
 ### D4. How are indexes built and maintained over time?
 
@@ -553,19 +608,50 @@ reasons the hash cannot cover:
 
 ### E4. Can retrieval be filtered by metadata?
 
-- **State:** ❌ — and there is a **dead parameter advertising it.**
-- **Now:** `DocumentService.retrieve()` and `query()` both accept `filters: dict | None`. It is
-  threaded into the answer-cache key (so different `filters` values produce different cache
-  entries) but **never applied to the query** — the docstring says "reserved for forward-compat."
-  Two callers passing different filters get correctly-separated cache entries containing
-  *identically unfiltered* results. That is worse than not having the parameter.
+- **State:** ✅ — implemented over the A4 column.
+- **Was:** ❌, **with a dead parameter advertising it.** `retrieve()` and `query()` both accepted
+  `filters: dict | None`, threaded it into the answer-cache key (so different `filters` values
+  produced different cache entries) and **never applied it to the query**. Two callers passing
+  different filters got correctly-separated cache entries containing *identically unfiltered*
+  results — worse than not having the parameter, because the next engineer would reasonably assume
+  passing `{"classification": "public"}` did something.
 - **Options:** (a) remove it until implemented; (b) implement over the A4 JSONB column; (c)
   implement and make it governance-bearing (H8).
-- **Call:** **(a) today, (b) when A4 lands.** An unimplemented filter parameter on a multi-tenant
-  retrieval API is a security-shaped footgun: the next engineer will reasonably assume passing
-  `{"classification": "public"}` does something.
-- **Proof:** A test asserting a filtered query cannot return a non-matching chunk. Once (b) lands,
-  measure filtered-ANN recall — filtering interacts with D3 and can degrade it further.
+- **Call:** **(b).** The original call here was "(a) today, (b) when A4 lands" — A4 landing first
+  reversed the order, so the parameter was implemented rather than deleted.
+- **Now:** `filters` is applied inside the vector query as JSONB containment, ANDed with the owner
+  scope, so `top_k` counts *matching* chunks instead of being eaten by non-matching ones. The
+  accepted surface is deliberately small — a flat map of scalars, validated in
+  `ingestion/metadata.py` and rejected with a 422 otherwise. Ranges and OR are not expressible and
+  are not pretended to be.
+
+**Why `@>` and not `->>`.** The intuitive form reads better and is the wrong choice:
+
+```sql
+-- Implemented. Uses ix_document_chunks_metadata_gin.
+WHERE owner_id = :uid AND metadata @> '{"language":"es","doc_type":"contract"}'::jsonb
+
+-- Equivalent result, no index.
+WHERE owner_id = :uid AND metadata->>'language' = 'es' AND metadata->>'doc_type' = 'contract'
+```
+
+Measured on 20k chunks (pgvector 0.8.2 / PG 16), `EXPLAIN ANALYZE` of the two predicates alone:
+
+```
+@>   Bitmap Heap Scan  (actual rows=800)  ->  Bitmap Index Scan on ..._metadata_gin (rows=800)
+->>  Seq Scan          (actual rows=800)      Rows Removed by Filter: 19200
+```
+
+A GIN index over `jsonb_path_ops` indexes containment, not text extraction. Making `->>` indexable
+needs one expression index **per key** — which is the per-field migration the JSONB column exists
+to avoid, reintroduced at the index layer. `jsonb_path_ops` over the default `jsonb_ops` for the
+same reason: containment is the only operator used, and the key-existence support is index bloat
+paid for on every write.
+
+- **Proof:** `tests/test_metadata_filtering.py` — a filtered query cannot return a non-matching
+  chunk (asserted per row, since an ignored filter yields a plausible result set of the right
+  size); an unmatched filter narrows to empty rather than falling open; absent keys do not match;
+  filtering does not widen the tenant boundary. Filtering interacts with D3 — see below.
 
 ### E5. Is there a second-stage reranker?
 
@@ -949,14 +1035,25 @@ than having built it.
 Ordered by *what unblocks the most other decisions*, not by effort.
 
 ### Tier 0 — Correctness bugs live in the code today
-1. **D3** — filtered-ANN under-return. Multi-tenant recall silently collapses as tenants grow.
+1. ~~**D3** — filtered-ANN under-return.~~ **Mitigated, unproven.** `ef_search` +
+   `hnsw.iterative_scan` now applied per query, and the HNSW index exists under test. What remains
+   is the measurement: recall against a synthetic multi-tenant corpus large enough to reproduce the
+   collapse. Until that runs, treat the fix as plausible rather than demonstrated.
 2. **C5** — mixed embedding models rank silently and wrongly.
 3. **C2** — hardcoded `Vector(1536)` vs. swappable `settings.embedding_model`.
-4. **E4** — remove the unimplemented `filters` parameter.
+4. ~~**E4** — remove the unimplemented `filters` parameter.~~ **Done — implemented instead.** A4
+   landed first, which reversed the call: `filters` is applied as JSONB containment inside the ANN
+   query rather than deleted. See E4.
 5. **E8/H1** — bound `top_k` and the context budget.
 6. **H8(1)** — refuse to boot in production with the default JWT secret.
 
 *None of these need a new subsystem. All are latent production incidents.*
+
+**What closing two of them changed about the list.** Both were fixed by the same piece of work, and
+neither is fully retired: D3 keeps its proof obligation, and E4's filtering makes that obligation
+more pressing rather than less. The remaining four are untouched, and **C2 is now the most
+awkward** — `metadata` proved that a schema change is one migration, which removes the last excuse
+for a dimension hardcoded in three places.
 
 ### Tier 1 — Build the instrument
 7. **G1–G5** — golden dataset, retrieval metrics, generation metrics, harness, CI gate.

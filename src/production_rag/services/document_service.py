@@ -7,6 +7,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from production_rag.ingestion.idempotency import query_idempotency_key
 from production_rag.ingestion.loaders import ExtractedSegment
+from production_rag.ingestion.metadata import validate_metadata_filter
 from production_rag.ingestion.normalize import (
     NORMALIZER_VERSION,
     normalize_segments,
@@ -16,7 +17,11 @@ from production_rag.llm.client import LLMClient
 from production_rag.llm.embedding_service import EmbeddingService
 from production_rag.logging_config import get_logger
 from production_rag.models.document import Document, DocumentChunk
-from production_rag.repositories.document_repository import DocumentRepository
+from production_rag.repositories.document_repository import (
+    DEFAULT_EF_SEARCH,
+    DEFAULT_ITERATIVE_SCAN,
+    DocumentRepository,
+)
 from production_rag.repositories.query_cache_repository import QueryCacheRepository
 from production_rag.schemas.document import ChunkSource, QueryResponse
 
@@ -158,12 +163,16 @@ class DocumentService:
         llm_client: LLMClient,
         query_cache_repository: QueryCacheRepository,
         query_cache_ttl_seconds: int = 3600,
+        hnsw_ef_search: int = DEFAULT_EF_SEARCH,
+        hnsw_iterative_scan: str = DEFAULT_ITERATIVE_SCAN,
     ) -> None:
         self._repository = repository
         self._embedding_service = embedding_service
         self._llm = llm_client
         self._query_cache = query_cache_repository
         self._query_cache_ttl_seconds = query_cache_ttl_seconds
+        self._hnsw_ef_search = hnsw_ef_search
+        self._hnsw_iterative_scan = hnsw_iterative_scan
 
     async def retrieve(
         self,
@@ -182,8 +191,13 @@ class DocumentService:
         lives in ``query()``), so calling this always exercises real embedding +
         vector search. ``use_cache`` is accepted so callers express intent
         uniformly; an eval harness passes ``use_cache=False`` to guarantee it is
-        measuring retrieval and never a warm answer cache. ``filters`` is
-        reserved for forward-compat (not yet applied at the retrieval layer).
+        measuring retrieval and never a warm answer cache.
+
+        ``filters`` restricts the search to chunks whose extracted metadata
+        contains every given key/value — ``{"language": "es", "doc_type":
+        "contract"}`` searches only Spanish contracts. It is applied *inside* the
+        vector query, not by discarding results afterwards, so ``top_k`` counts
+        matching chunks rather than being silently eaten by non-matching ones.
         """
         # Normalize the question under the SAME rules the corpus was normalized
         # with. Skipping this leaves an asymmetry that never raises an error and
@@ -192,6 +206,11 @@ class DocumentService:
         # embedded against text that no longer contains those characters.
         question = normalize_text(question)
 
+        # Validated here rather than only at the HTTP edge: retrieve() is called
+        # directly by the agent tools and by eval harnesses, which do not pass
+        # through the request schema.
+        filters = validate_metadata_filter(filters)
+
         # Embed the question, then rank chunks by cosine similarity (higher is
         # better). search_similar_chunks already returns (chunk, similarity).
         query_embedding = await self._embedding_service.embed_text(question)
@@ -199,6 +218,9 @@ class DocumentService:
             query_embedding=query_embedding,
             user_id=user_id,
             top_k=top_k,
+            filters=filters,
+            ef_search=self._hnsw_ef_search,
+            iterative_scan=self._hnsw_iterative_scan,
         )
         return [ScoredChunk(chunk=chunk, score=score) for chunk, score in scored]
 

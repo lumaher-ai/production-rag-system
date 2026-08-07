@@ -20,6 +20,7 @@ in flight); without one, the caller owns the transaction.
 """
 
 from pathlib import Path
+from typing import Any
 from uuid import UUID
 
 from sqlalchemy.exc import IntegrityError
@@ -28,7 +29,8 @@ from production_rag.config import Settings
 from production_rag.exceptions import ValidationError
 from production_rag.ingestion.connectors import fetch_source
 from production_rag.ingestion.idempotency import content_hash
-from production_rag.ingestion.loaders import ExtractedSegment, load_file
+from production_rag.ingestion.loaders import ExtractedSegment, load_file, resolve_mime
+from production_rag.ingestion.metadata import METADATA_VERSION, extract_metadata
 from production_rag.ingestion.normalize import NORMALIZER_VERSION
 from production_rag.ingestion.sources import parse_source_uri
 from production_rag.llm.client import count_tokens
@@ -101,7 +103,7 @@ class IngestionService:
             )
             await self._jobs.reset_progress(job)
 
-        segments, filename = await self._materialize(job, settings)
+        segments, filename, content_type = await self._materialize(job, settings)
 
         return await self._persist(
             # The caller's title wins; otherwise derive it from the filename the
@@ -111,6 +113,7 @@ class IngestionService:
             user_id=job.user_id,
             source=job.source,
             job=job,
+            mime_type=resolve_mime(filename, content_type),
         )
 
     async def ingest_now(
@@ -138,7 +141,7 @@ class IngestionService:
 
     async def _materialize(
         self, job: IngestionJob, settings: Settings
-    ) -> tuple[list[ExtractedSegment], str | None]:
+    ) -> tuple[list[ExtractedSegment], str | None, str | None]:
         """Get the document's bytes and parse them into segments.
 
         Uploads carry their bytes on the job row (the worker cannot read the
@@ -146,9 +149,11 @@ class IngestionService:
         re-fetched here, which keeps a 100 MiB blob out of the database for
         every source that can be fetched again.
 
-        Returns the filename alongside the segments: for a URI source it is
-        discovered by the fetch (from Content-Disposition or the URL path) and
-        is not knowable when the job is created.
+        Returns the filename and content type alongside the segments: for a URI
+        source both are discovered by the fetch (from Content-Disposition, the
+        response headers, or the URL path) and are not knowable when the job is
+        created. They outlive the loader dispatch because the resolved MIME is
+        stored as document metadata, not just used to pick a parser.
 
         Three sources of bytes, in preference order:
 
@@ -180,18 +185,21 @@ class IngestionService:
             else:
                 return await self._segments_from_stored_body(job)
 
-        return load_file(content, filename, content_type), filename
+        return load_file(content, filename, content_type), filename, content_type
 
     async def _segments_from_stored_body(
         self, job: IngestionJob
-    ) -> tuple[list[ExtractedSegment], str | None]:
+    ) -> tuple[list[ExtractedSegment], str | None, str | None]:
         """Rebuild segments from the persisted document body (re-index only).
 
         The body survives as ``Document.content``, so a document can be
         re-processed under new normalization/chunking rules without asking the
         user to re-upload. What does not survive is structure: the stored body is
         segments already joined, so this returns a single section-less,
-        page-less segment and the rebuilt chunks lose that provenance.
+        page-less segment and the rebuilt chunks lose that provenance. The
+        content type is likewise gone — the job's payload carried it and was
+        cleared — so ``metadata.mime_type`` is re-derived from the source URI's
+        extension where one survives, and otherwise omitted.
         """
         existing = await self._documents.find_document_by_source(
             user_id=job.user_id, source=job.source
@@ -215,7 +223,7 @@ class IngestionService:
                 else "document had no page/section provenance to lose"
             ),
         )
-        return [ExtractedSegment(text=existing.content)], existing.title
+        return [ExtractedSegment(text=existing.content)], existing.title, None
 
     async def _persist(
         self,
@@ -224,11 +232,23 @@ class IngestionService:
         user_id: UUID,
         source: str,
         job: IngestionJob | None,
+        mime_type: str | None = None,
     ) -> Document | None:
         full_content, chunks = build_chunks(segments)
         if not chunks:
             raise ValidationError("No extractable text found in the document.")
 
+        # Metadata is NOT extracted here. Both places that need it sit past the
+        # idempotency gate below, and the gate's whole purpose is that an
+        # unchanged, up-to-date document does no work — so extraction happens at
+        # each use site instead. The two are mutually exclusive (the skip branch
+        # returns), so this still runs at most once per call, and not at all on
+        # the common no-op re-ingest.
+        #
+        # Today that saves a few milliseconds. It also keeps the cheap path cheap
+        # if extraction ever stops being cheap: an extractor that called a model
+        # would otherwise bill a request every time a re-ingest decided to do
+        # nothing, and nothing about the code would look wrong.
         chash = content_hash(full_content)
         embedding_model = self._embeddings.model
         resuming = job is not None and job.processed_chunks > 0
@@ -240,6 +260,14 @@ class IngestionService:
         # Unchanged content short-circuits before any embedding spend. Skipped
         # when resuming: the hash already matches (the document row was written
         # on the first attempt) but its chunks are only partly there.
+        #
+        # METADATA_VERSION is deliberately NOT one of these conditions. The other
+        # three are silent inputs to a stored *vector* — change one and the
+        # embeddings mean something different while the text looks identical, so
+        # the only safe response is to re-embed. Extracted metadata never reaches
+        # the embedding model, so gating on it would turn adding a keyword to a
+        # marker list into a full-corpus re-embed. It is handled below instead, at
+        # the cost it actually warrants: two UPDATEs.
         if (
             not resuming
             and existing is not None
@@ -248,6 +276,23 @@ class IngestionService:
             and existing.chunker_version == CHUNKER_VERSION
             and existing.embedding_model == embedding_model
         ):
+            # Content is unchanged but the extractor may have moved since this row
+            # was written. Left alone, it would keep answering filters under rules
+            # that no longer apply — invisible, because nothing about a stale
+            # metadata value looks like an error.
+            if existing.doc_metadata.get("extractor_version") != METADATA_VERSION:
+                await self._documents.refresh_metadata(
+                    existing, extract_metadata(full_content, mime_type=mime_type)
+                )
+                # Cached answers were computed against the old metadata, so the
+                # filters that produced them may no longer select the same chunks.
+                await self._query_cache.delete_by_user(user_id)
+                logger.info(
+                    "document_metadata_refreshed",
+                    document_id=str(existing.id),
+                    extractor_version=METADATA_VERSION,
+                )
+
             logger.info(
                 "document_ingest_skipped",
                 document_id=str(existing.id),
@@ -268,6 +313,11 @@ class IngestionService:
             chunk_count=len(chunks),
         )
 
+        # Extracted from the *normalized* body, so the extractor reads the same
+        # string the embedding model does rather than the loader's ligatures and
+        # stray whitespace.
+        metadata = extract_metadata(full_content, mime_type=mime_type)
+
         document = await self._upsert_document(
             existing=existing,
             resuming=resuming,
@@ -278,6 +328,7 @@ class IngestionService:
             chash=chash,
             embedding_model=embedding_model,
             chunk_count=len(chunks),
+            metadata=metadata,
         )
         if document is None:  # lost a concurrent race; the winner owns this source
             return await self._documents.find_document_by_source(
@@ -293,6 +344,7 @@ class IngestionService:
             user_id=user_id,
             start_index=job.processed_chunks if job is not None else 0,
             job=job,
+            metadata=metadata,
         )
 
         # New content invalidates this user's cached answers.
@@ -320,6 +372,7 @@ class IngestionService:
         chash: str,
         embedding_model: str,
         chunk_count: int,
+        metadata: dict[str, Any],
     ) -> Document | None:
         """Create or replace the document row. ``None`` means a race was lost."""
         if existing is not None:
@@ -336,6 +389,7 @@ class IngestionService:
                 normalizer_version=NORMALIZER_VERSION,
                 chunker_version=CHUNKER_VERSION,
                 embedding_model=embedding_model,
+                doc_metadata=metadata,
             )
             logger.info("document_replaced", document_id=str(document.id), title=title)
             return document
@@ -354,6 +408,7 @@ class IngestionService:
                     chunker_version=CHUNKER_VERSION,
                     embedding_model=embedding_model,
                     source=source,
+                    doc_metadata=metadata,
                 )
         except IntegrityError:
             logger.info("document_ingest_raced", source=source)
@@ -366,6 +421,7 @@ class IngestionService:
         user_id: UUID,
         start_index: int,
         job: IngestionJob | None,
+        metadata: dict[str, Any],
     ) -> None:
         """Embed and write chunks in batches, checkpointing after each.
 
@@ -399,6 +455,12 @@ class IngestionService:
                     char_end=chunk.char_end,
                     page=chunk.page,
                     section=chunk.section,
+                    # Denormalized from the document so the ANN query can filter
+                    # without joining. Document-level, so every chunk gets the
+                    # same dict — it is not derived per chunk, which keeps
+                    # build_chunks pure and a resumed job's chunks consistent
+                    # with the ones written before the interruption.
+                    doc_metadata=metadata,
                 )
 
             processed = offset + len(batch)

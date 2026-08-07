@@ -1,14 +1,25 @@
-from typing import TYPE_CHECKING
+import json
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
-from sqlalchemy import delete, or_, select
+from sqlalchemy import delete, or_, select, text, update
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from production_rag.exceptions import NotFoundError
+from production_rag.logging_config import get_logger
 from production_rag.models.document import Document, DocumentChunk
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSessionTransaction
+
+logger = get_logger(__name__)
+
+# Query-time recall knobs for the HNSW index, applied per statement. Defaults
+# here match ``Settings``; callers pass the configured values through.
+DEFAULT_EF_SEARCH = 100
+DEFAULT_ITERATIVE_SCAN = "relaxed_order"
 
 
 class DocumentNotFoundError(NotFoundError):
@@ -35,6 +46,7 @@ class DocumentRepository:
         chunker_version: str,
         embedding_model: str,
         source: str,
+        doc_metadata: dict[str, Any] | None = None,
     ) -> Document:
         document = Document(
             title=title,
@@ -46,6 +58,7 @@ class DocumentRepository:
             chunker_version=chunker_version,
             embedding_model=embedding_model,
             source=source,
+            doc_metadata=doc_metadata or {},
         )
         self._session.add(document)
         await self._session.flush()
@@ -79,6 +92,7 @@ class DocumentRepository:
         normalizer_version: str,
         chunker_version: str,
         embedding_model: str,
+        doc_metadata: dict[str, Any] | None = None,
     ) -> Document:
         """Rewrite an existing document's body/metadata in place (source is kept).
 
@@ -92,8 +106,30 @@ class DocumentRepository:
         document.normalizer_version = normalizer_version
         document.chunker_version = chunker_version
         document.embedding_model = embedding_model
+        document.doc_metadata = doc_metadata or {}
         await self._session.flush()
         return document
+
+    async def refresh_metadata(
+        self,
+        document: Document,
+        doc_metadata: dict[str, Any],
+    ) -> None:
+        """Rewrite a document's metadata and its chunks', touching nothing else.
+
+        The cheap half of a re-ingest, for the case where the content is provably
+        unchanged but the extractor that produced its metadata has moved. Two
+        UPDATEs and no embedding calls — which is exactly why the extractor
+        version is kept out of the idempotency gate: putting it there would turn
+        a keyword-list tweak into a full corpus re-embed.
+        """
+        document.doc_metadata = doc_metadata
+        await self._session.execute(
+            update(DocumentChunk)
+            .where(DocumentChunk.document_id == document.id)
+            .values(doc_metadata=doc_metadata)
+        )
+        await self._session.flush()
 
     async def delete_chunks_by_document_id(self, document_id: UUID) -> None:
         """Delete all chunks belonging to a document (used before re-chunking)."""
@@ -115,6 +151,7 @@ class DocumentRepository:
         char_end: int | None = None,
         page: int | None = None,
         section: str | None = None,
+        doc_metadata: dict[str, Any] | None = None,
     ) -> DocumentChunk:
         chunk = DocumentChunk(
             document_id=document_id,
@@ -128,6 +165,7 @@ class DocumentRepository:
             char_end=char_end,
             page=page,
             section=section,
+            doc_metadata=doc_metadata or {},
         )
         self._session.add(chunk)
         await self._session.flush()
@@ -140,11 +178,58 @@ class DocumentRepository:
             raise DocumentNotFoundError(f"Document {document_id} not found")
         return document
 
+    async def _apply_ann_settings(self, ef_search: int, iterative_scan: str) -> None:
+        """Set the HNSW query-time GUCs for the current transaction.
+
+        ``iterative_scan`` is the fix for pgvector's filtered-ANN under-return: an
+        HNSW scan walks the graph and applies ``WHERE`` to what it finds, so a
+        query whose filters exclude most of the graph's first ``ef_search`` hits
+        returns **fewer rows than LIMIT, with no error**. Recall degrades silently
+        as tenants and metadata predicates multiply. Iterative scan re-scans until
+        the limit is satisfied. ``ef_search`` widens each pass (pgvector's default
+        of 40 is tuned for unfiltered search).
+
+        ``SET LOCAL`` scopes both to the surrounding transaction, so a pooled
+        connection never carries them into an unrelated request.
+
+        Unsupported settings (pgvector < 0.8 has no ``iterative_scan``) degrade
+        rather than fail: the query still returns correct rows, just possibly
+        fewer than ``top_k``. Each attempt runs in its own savepoint because a
+        failed statement otherwise aborts the caller's transaction.
+        """
+        # SET takes a literal, never a bind parameter — ``SET LOCAL x = $1`` is a
+        # syntax error, and because these statements are allowed to fail softly it
+        # would have failed *silently*, leaving the settings unapplied. Both values
+        # come from Settings rather than from a request, and both are constrained
+        # here so the interpolation cannot carry anything but what it claims to.
+        statements: list[str] = []
+        if ef_search > 0:
+            statements.append(f"SET LOCAL hnsw.ef_search = {int(ef_search)}")
+        if iterative_scan:
+            if iterative_scan not in ("relaxed_order", "strict_order", "off"):
+                raise ValueError(f"Invalid hnsw.iterative_scan value: {iterative_scan!r}")
+            statements.append(f"SET LOCAL hnsw.iterative_scan = '{iterative_scan}'")
+
+        for sql in statements:
+            try:
+                async with self._session.begin_nested():
+                    await self._session.execute(text(sql))
+            except DBAPIError as exc:
+                logger.warning(
+                    "hnsw_setting_unsupported",
+                    statement=sql,
+                    detail=str(exc.orig),
+                    consequence="filtered search may return fewer than top_k rows",
+                )
+
     async def search_similar_chunks(
         self,
         query_embedding: list[float],
         user_id: UUID,
         top_k: int = 5,
+        filters: dict[str, Any] | None = None,
+        ef_search: int = DEFAULT_EF_SEARCH,
+        iterative_scan: str = DEFAULT_ITERATIVE_SCAN,
     ) -> list[tuple[DocumentChunk, float]]:
         """Find the most similar chunks to a query embedding using cosine distance.
 
@@ -153,15 +238,46 @@ class DocumentRepository:
         *distance*; similarity is ``1 - distance``, so higher is a better match.
         The score is selected alongside the row rather than recomputed, so callers
         can rank, threshold, or surface it without re-querying.
+
+        ``filters`` is a flat metadata map, applied as JSONB **containment**
+        (``metadata @> :filters``) against the denormalized per-chunk metadata.
+        Containment is what the ``jsonb_path_ops`` GIN index accelerates; the
+        equivalent-looking ``metadata->>'language' = 'es'`` does not use that index
+        and degrades to a scan, and making it indexable would need one expression
+        index per key — the per-field migration the JSONB column exists to avoid.
+
+        The filter is a *pre-filter in SQL*, but pgvector applies it after walking
+        the HNSW graph, which is why ``_apply_ann_settings`` runs first. Callers
+        must validate ``filters`` (see ``ingestion.metadata.validate_metadata_filter``)
+        — it is trusted here to be a flat map of scalars.
         """
+        await self._apply_ann_settings(ef_search, iterative_scan)
+
         distance = DocumentChunk.embedding.cosine_distance(query_embedding)
+        # Owner scope comes from the denormalized owner_id — no join to documents
+        # needed (title and metadata are carried on the chunk too).
+        stmt = select(DocumentChunk, distance.label("distance")).where(
+            DocumentChunk.owner_id == user_id
+        )
+        if filters:
+            # Bound as a parameter, so a filter value can never be SQL. The JSONB
+            # cast is explicit because the driver sends the dict as text.
+            stmt = stmt.where(
+                DocumentChunk.doc_metadata.op("@>", is_comparison=True)(
+                    text("CAST(:metadata_filter AS jsonb)").bindparams(
+                        metadata_filter=json.dumps(filters, sort_keys=True)
+                    )
+                )
+            )
+        stmt = stmt.order_by(distance).limit(top_k)
+
+        # ``relaxed_order`` lets pgvector return rows in approximate distance
+        # order. ScoredChunk.score is what eval harnesses rank on, so exact order
+        # is restored outside the scan rather than trusted from it.
+        subquery = stmt.subquery()
+        chunk = aliased(DocumentChunk, subquery)
         result = await self._session.execute(
-            # Owner scope comes from the denormalized owner_id — no join to
-            # documents needed (title is already carried on the chunk too).
-            select(DocumentChunk, distance.label("distance"))
-            .where(DocumentChunk.owner_id == user_id)
-            .order_by(distance)
-            .limit(top_k)
+            select(chunk, subquery.c.distance).order_by(subquery.c.distance)
         )
         return [(row[0], 1.0 - row.distance) for row in result.all()]
 
