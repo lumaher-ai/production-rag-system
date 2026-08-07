@@ -163,18 +163,67 @@ What remains is: retrieval quality (Part E), the measurement layer that would ju
 
 ### A3. What normalization is applied before embedding?
 
-- **State:** ❌
-- **Now:** None. Loader output goes straight into the splitter. PDF extraction artifacts (ligatures,
-  hyphen-broken words, repeated headers/footers, page numbers), HTML boilerplate, non-breaking
-  spaces, and inconsistent Unicode all become embedded tokens.
-- **Options:** (a) none; (b) mechanical (NFKC, whitespace collapse, de-hyphenation, control-char
-  strip); (c) + boilerplate/header-footer detection; (d) + LLM-based cleanup.
-- **Call:** **(b) now, (c) for PDFs.** This is the highest quality-per-line-of-code change available
-  — embedding noise degrades *every* query forever, and no amount of reranking recovers it. Put it
-  in `ingestion/normalize.py`, applied per `ExtractedSegment` before chunking. **It must be
-  versioned into `CHUNKER_VERSION`** (or a new `normalizer_version`), or the existing idempotency
-  gate will serve vectors computed under the old rules.
-- **Proof:** Recall@10 on the golden set, before vs. after. Also: mean chunk token count should drop.
+- **State:** ✅ **DECIDED & IMPLEMENTED (2026-08-07)** — mechanical NFKC + whitespace, versioned into
+  the idempotency gate, applied to documents *and* queries.
+- **Was:** None. Loader output went straight into the splitter, so ligatures, non-breaking spaces,
+  zero-width joiners, `\r\n`, and column-layout space runs all became embedded tokens.
+- **Decision taken:** (b), in `ingestion/normalize.py`. Six ordered rules: NFKC → unify line endings
+  → strip invisibles and control characters → collapse intra-line whitespace → cap blank runs at one
+  → trim. Segments that normalize to empty are dropped. Rule order is load-bearing: **line-ending
+  conversion must precede the control-character strip**, because `\r` *is* a control character, so
+  stripping first deletes a lone `\r` and silently loses that line break. A unit test caught this.
+- **Applied inside `build_chunks`, not as a step before it.** That follows the principle
+  `ingestion/idempotency.py` already states about its key functions — a caller must have no way to
+  skip it. It also keeps `char_start`/`char_end` truthful, since chunks and the stored
+  `Document.content` come from the same normalized string.
+- **Queries are normalized too**, under identical rules. Skipping that leaves an asymmetry that
+  never errors: the corpus is NFKC-folded, so a question containing `ﬁ` would be embedded against
+  text that no longer holds that character, and it would surface only as quietly worse recall.
+
+**Why `normalizer_version` is load-bearing, precisely.** `content_hash` is computed over
+*normalized* text, so a rules change that alters a document changes its hash and trips the gate on
+its own — the hash is the more precise detector. The version is not redundant with it, for three
+reasons the hash cannot cover:
+
+1. **The query side is never hashed.** A normalized question is embedded and discarded, so the
+   version is the only thing that can invalidate a cached answer when the rules move. It is
+   therefore a mandatory keyword of `query_idempotency_key`.
+2. **Targeted re-processing.** "Which documents predate the fix?" is an indexed column comparison
+   (`DocumentRepository.find_stale`), not a re-normalize-the-corpus-and-diff.
+3. **Robustness to a plausible refactor.** Hashing raw bytes instead of normalized text is a
+   tempting optimization — it would let you skip re-parsing. The moment someone does that, the
+   version is the only thing standing between them and silently mixed embeddings.
+
+- **NFKC is lossy and that is accepted:** `x²→x2`, `½→1⁄2`, `𝐀→A`. Chosen because the retrieval win
+  (a search for `file` matching a PDF's `ﬁle`) outweighs math fidelity for a prose-heavy corpus. A
+  test pins this so a future change to it is deliberate; a math-heavy corpus would want NFC, which
+  would be a different normalizer and therefore a different version string.
+- **Existing rows were stamped `'none'`, not the current version** — the single easiest thing to get
+  wrong here. Stamping them current would mark un-normalized content as up to date and permanently
+  hide it from the gate, which is exactly the failure this column exists to prevent.
+- **`reindex` CLI** — `find_stale` → one ingestion job per document, reusing A2's queue, resume, and
+  status machinery rather than a second ingestion path. This needed a third branch in
+  `_materialize`: a re-index of an `upload://` document has neither staged payload (cleared on
+  success) nor a fetchable URI, so it falls back to the stored `Document.content` — which is the
+  *joined* segment text, so **page/section provenance cannot be recovered**. The worker logs that per
+  document, and distinguishes "provenance lost" from "there was none to lose."
+- **Proof (measured on the real corpus):** all 6 documents re-indexed from `none` → `nfkc-ws-v1`.
+  The arXiv paper and Drive playbook kept full page provenance through the re-fetch path (52/52 and
+  22/22 chunks with `page` set); the three `upload://` `.txt` documents used the stored-body path and
+  correctly logged that they had no provenance to lose. One document's chunk count dropped 233→227 —
+  normalization collapsing whitespace, in the predicted direction. 179 tests pass, including the
+  central regression: bump `NORMALIZER_VERSION`, re-ingest identical bytes, assert it re-embeds
+  instead of short-circuiting.
+- **A real hazard this exposed, worth keeping:** during verification a *stale worker process* from an
+  earlier session — running code from before normalization existed — consumed one re-index job,
+  applied the old gate, and reported `succeeded` without doing anything. Nothing in the queue, the
+  job row, or the logs flagged it. This is the generic risk of any queue with rolling deploys: mixed
+  code versions consuming the same jobs. It is also a live argument *for* the version column, since
+  the affected document remained visibly stale (`normalizer_version='none'`) and the next
+  `reindex --dry-run` surfaced it immediately. Worth a follow-up: workers should record their code
+  version on the jobs they complete.
+- **Open:** recall impact is unmeasured. The claim that normalization improves retrieval is
+  reasonable and standard, but it is exactly the kind of thing **Part G** exists to prove.
 
 ### A4. What metadata is attached to a chunk, and where does it come from?
 
