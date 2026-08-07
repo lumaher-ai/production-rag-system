@@ -13,7 +13,9 @@ from production_rag.llm.client import LLMClient
 from production_rag.llm.embedding_service import EmbeddingService
 from production_rag.models import User
 from production_rag.models.enums import UserRole
+from production_rag.queue import JobQueue
 from production_rag.repositories.document_repository import DocumentRepository
+from production_rag.repositories.ingestion_job_repository import IngestionJobRepository
 from production_rag.repositories.query_cache_repository import QueryCacheRepository
 from production_rag.repositories.refresh_token_repository import RefreshTokenRepository
 from production_rag.repositories.user_repository import UserRepository
@@ -119,6 +121,27 @@ def get_document_repository(
     session: AsyncSession = Depends(get_db_session),
 ) -> DocumentRepository:
     return DocumentRepository(session)
+
+
+def get_ingestion_job_repository(
+    session: AsyncSession = Depends(get_db_session),
+) -> IngestionJobRepository:
+    return IngestionJobRepository(session)
+
+
+def get_job_queue(request: Request) -> JobQueue:
+    """The queue the API enqueues ingestion work onto.
+
+    Resolved from app state rather than constructed per request so one Redis
+    pool is shared. Tests override this dependency with a recorder, which is why
+    routes depend on the ``JobQueue`` protocol instead of arq directly.
+    """
+    queue = getattr(request.app.state, "job_queue", None)
+    if queue is None:
+        raise RuntimeError(
+            "Job queue is not initialized — the application lifespan did not run."
+        )
+    return queue
 
 
 def get_query_cache_repository(

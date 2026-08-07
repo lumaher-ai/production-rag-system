@@ -162,7 +162,13 @@ EXTENSION_TO_MIME: dict[str, str] = {
 }
 
 
-def _resolve_loader(filename: str | None, content_type: str | None) -> FileLoader | None:
+def resolve_loader(filename: str | None, content_type: str | None) -> FileLoader | None:
+    """Pick a loader for a file, or ``None`` if the format is unsupported.
+
+    Public so the upload endpoint can reject an unsupported type *before*
+    queueing a job — a synchronous 415 is far more useful than a job that fails
+    a second later with the same message.
+    """
     ext = Path(filename).suffix.lower() if filename else ""
     mime = EXTENSION_TO_MIME.get(ext)
     if mime is not None:
@@ -183,7 +189,7 @@ def load_file(
     Raises ``UnsupportedFileTypeError`` (415) for unknown formats and
     ``ValidationError`` (422) when nothing extractable is found.
     """
-    loader = _resolve_loader(filename, content_type)
+    loader = resolve_loader(filename, content_type)
     if loader is None:
         logger.warning("upload_unsupported_type", filename=filename, content_type=content_type)
         raise UnsupportedFileTypeError(

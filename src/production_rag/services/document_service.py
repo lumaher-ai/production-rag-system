@@ -4,11 +4,10 @@ from typing import Any
 from uuid import UUID
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from sqlalchemy.exc import IntegrityError
 
-from production_rag.ingestion.idempotency import content_hash, query_idempotency_key
+from production_rag.ingestion.idempotency import query_idempotency_key
 from production_rag.ingestion.loaders import ExtractedSegment
-from production_rag.llm.client import LLMClient, count_tokens
+from production_rag.llm.client import LLMClient
 from production_rag.llm.embedding_service import EmbeddingService
 from production_rag.logging_config import get_logger
 from production_rag.models.document import Document, DocumentChunk
@@ -17,6 +16,23 @@ from production_rag.repositories.query_cache_repository import QueryCacheReposit
 from production_rag.schemas.document import ChunkSource, QueryResponse
 
 logger = get_logger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedChunk:
+    """One chunk of a document, with its provenance, before embedding.
+
+    Produced by ``build_chunks`` and consumed by the ingestion pipeline. Kept
+    separate from the ORM row so chunking can be derived, compared, and counted
+    without touching the database — which is what lets a resumed job re-derive
+    the same list and skip the part already written.
+    """
+
+    text: str
+    char_start: int | None
+    char_end: int | None
+    page: int | None
+    section: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,7 +55,71 @@ CHUNK_OVERLAP = 200
 # Version of the chunking behaviour above. Part of every idempotency key — BUMP
 # this whenever CHUNK_SIZE / CHUNK_OVERLAP / separators / splitter change, so
 # content chunked under the old config is re-embedded instead of served stale.
+# It is also what makes a resumed ingestion job safe: a job records the version
+# its completed chunks were produced under, and restarts from zero if it moved.
 CHUNKER_VERSION = "recursive-char-v1"
+
+# Separator used to join segments into the stored document body. Chunk offsets
+# are computed against the joined text, so this must not change without a
+# CHUNKER_VERSION bump.
+SEGMENT_SEPARATOR = "\n\n"
+
+
+def build_splitter() -> RecursiveCharacterTextSplitter:
+    """The chunker, as a single source of truth.
+
+    Built from module-level constants so the request path, the worker, and any
+    eval harness are provably chunking identically — a resumed job that chunked
+    differently from its first attempt would splice two chunkings together.
+    """
+    return RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+        separators=["\n\n", "\n", ". ", " ", ""],  # Recursive character splitting strategy
+        add_start_index=True,  # record each chunk's offset in the source (for citations)
+    )
+
+
+def build_chunks(segments: list[ExtractedSegment]) -> tuple[str, list[PreparedChunk]]:
+    """Split segments into chunks. Pure, deterministic, and side-effect free.
+
+    Returns the joined document body and its chunks. Each segment is chunked
+    independently so its ``page``/``section`` provenance carries onto every
+    chunk; char offsets are made global against the joined body, which is what
+    gets stored as ``Document.content``.
+
+    **Determinism is a correctness requirement, not a nicety.** A worker
+    resuming a partly-done job re-runs this function and skips the first
+    ``processed_chunks`` entries; if the output differed between attempts, the
+    document would end up with a mixture of two chunkings.
+    """
+    sep_len = len(SEGMENT_SEPARATOR)
+    full_content = SEGMENT_SEPARATOR.join(seg.text for seg in segments)
+
+    splitter = build_splitter()
+    chunks: list[PreparedChunk] = []
+    base_offset = 0
+    for seg in segments:
+        for doc in splitter.create_documents([seg.text]):
+            text = doc.page_content
+            # start_index is -1 if the splitter couldn't locate the chunk; treat
+            # that as "unknown" (None) rather than storing a bogus offset.
+            local_start = doc.metadata.get("start_index")
+            if local_start is not None and local_start < 0:
+                local_start = None
+            char_start = base_offset + local_start if local_start is not None else None
+            chunks.append(
+                PreparedChunk(
+                    text=text,
+                    char_start=char_start,
+                    char_end=char_start + len(text) if char_start is not None else None,
+                    page=seg.page,
+                    section=seg.section,
+                )
+            )
+        base_offset += len(seg.text) + sep_len
+
+    return full_content, chunks
 
 # Prompt
 
@@ -71,12 +151,6 @@ class DocumentService:
         self._llm = llm_client
         self._query_cache = query_cache_repository
         self._query_cache_ttl_seconds = query_cache_ttl_seconds
-        self._splitter = RecursiveCharacterTextSplitter(
-            chunk_size=CHUNK_SIZE,
-            chunk_overlap=CHUNK_OVERLAP,
-            separators=["\n\n", "\n", ". ", " ", ""],  # Recursive character splitting strategy
-            add_start_index=True,  # record each chunk's offset in the source (for citations)
-        )
 
     async def retrieve(
         self,
@@ -228,170 +302,6 @@ class DocumentService:
                 expires_at=expires_at,
             )
         return response
-
-    async def ingest_segments(
-        self,
-        title: str,
-        segments: list[ExtractedSegment],
-        user_id: UUID,
-        source: str,
-    ) -> Document:
-        """Chunk, embed, and store a document from structured segments.
-
-        Identity is ``(user_id, source)``. Re-uploading the same source:
-          - unchanged content (same hash + chunker + embedding model) → no-op,
-            the existing document is returned and **no embedding happens**;
-          - edited content → the existing document is replaced *in place*: its old
-            chunks are deleted and new ones written, its body/hash updated, all in
-            the request's single transaction (a crash mid-way rolls back to the
-            old version). The document id is preserved.
-        A source not seen before is created fresh.
-
-        Each segment is chunked independently so its ``page``/``section``
-        provenance carries onto every chunk; char offsets are made global against
-        the joined ``full_content`` (the stored document body).
-        """
-        # Join with a fixed separator; SEP_LEN keeps the running offset aligned
-        # with the stored full_content so char_start/char_end point into it.
-        separator = "\n\n"
-        sep_len = len(separator)
-        full_content = separator.join(seg.text for seg in segments)
-
-        # Step 0: Locate any existing document for this source. Unchanged content
-        # under the same chunker + embedding model short-circuits before any
-        # embedding work; otherwise we fall through to (re)build its chunks.
-        chash = content_hash(full_content)
-        embedding_model = self._embedding_service.model
-        existing = await self._repository.find_document_by_source(
-            user_id=user_id,
-            source=source,
-        )
-        if existing is not None and (
-            existing.content_hash == chash
-            and existing.chunker_version == CHUNKER_VERSION
-            and existing.embedding_model == embedding_model
-        ):
-            logger.info(
-                "document_ingest_skipped",
-                document_id=str(existing.id),
-                title=title,
-                reason="unchanged_source",
-            )
-            return existing
-
-        # Step 1: Chunk each segment, carrying its provenance and a global offset.
-        chunk_texts: list[str] = []
-        chunk_meta: list[dict] = []  # {char_start, char_end, page, section}
-        base_offset = 0
-        for seg in segments:
-            split_docs = self._splitter.create_documents([seg.text])
-            for doc in split_docs:
-                text = doc.page_content
-                # start_index is -1 if the splitter couldn't locate the chunk; treat
-                # that as "unknown" (None) rather than storing a bogus offset.
-                local_start = doc.metadata.get("start_index")
-                if local_start is not None and local_start < 0:
-                    local_start = None
-                char_start = base_offset + local_start if local_start is not None else None
-                char_end = char_start + len(text) if char_start is not None else None
-                chunk_texts.append(text)
-                chunk_meta.append(
-                    {
-                        "char_start": char_start,
-                        "char_end": char_end,
-                        "page": seg.page,
-                        "section": seg.section,
-                    }
-                )
-            base_offset += len(seg.text) + sep_len
-
-        logger.info(
-            "document_chunked",
-            title=title,
-            total_chars=len(full_content),
-            segment_count=len(segments),
-            chunk_count=len(chunk_texts),
-            chunk_size=CHUNK_SIZE,
-            chunk_overlap=CHUNK_OVERLAP,
-        )
-
-        # Step 2: Embed all chunks in a single batch call
-        embeddings = await self._embedding_service.embed_batch(chunk_texts)
-
-        # Step 3: Persist the document. Either replace the existing source in place
-        # (drop its old chunks, update its body/hash) or create a fresh row. Both
-        # run inside the request's single transaction, so a failure before commit
-        # rolls back to the previous version — an edited re-upload never leaves the
-        # document half-rewritten.
-        if existing is not None:
-            await self._repository.delete_chunks_by_document_id(existing.id)
-            document = await self._repository.update_document_content(
-                document=existing,
-                title=title,
-                content=full_content,
-                chunk_count=len(chunk_texts),
-                content_hash=chash,
-                chunker_version=CHUNKER_VERSION,
-                embedding_model=embedding_model,
-            )
-            logger.info("document_replaced", document_id=str(document.id), title=title)
-        else:
-            # A concurrent upload of the same source may have raced us to the
-            # unique (user_id, source) constraint — treat that as a hit.
-            try:
-                async with self._repository.savepoint():
-                    document = await self._repository.create_document(
-                        title=title,
-                        content=full_content,
-                        user_id=user_id,
-                        chunk_count=len(chunk_texts),
-                        content_hash=chash,
-                        chunker_version=CHUNKER_VERSION,
-                        embedding_model=embedding_model,
-                        source=source,
-                    )
-            except IntegrityError:
-                winner = await self._repository.find_document_by_source(
-                    user_id=user_id,
-                    source=source,
-                )
-                if winner is None:
-                    raise
-                logger.info("document_ingest_raced", document_id=str(winner.id), title=title)
-                return winner
-
-        # Step 4: Create chunk records with embeddings and provenance
-        chunks = []
-        for i, (text, meta, embedding) in enumerate(
-            zip(chunk_texts, chunk_meta, embeddings, strict=True)
-        ):
-            chunk = await self._repository.create_chunk(
-                document_id=document.id,
-                owner_id=user_id,
-                document_title=document.title,
-                chunk_index=i,
-                content=text,
-                token_count=count_tokens(text),
-                embedding=embedding,
-                char_start=meta["char_start"],
-                char_end=meta["char_end"],
-                page=meta["page"],
-                section=meta["section"],
-            )
-            chunks.append(chunk)
-
-        # New content invalidates this user's cached answers (they may now be stale).
-        await self._query_cache.delete_by_user(user_id)
-
-        logger.info(
-            "document_ingested",
-            document_id=str(document.id),
-            title=title,
-            chunks_created=len(chunks),
-            total_tokens=sum(c.token_count for c in chunks),
-        )
-
-        return document
 
     async def list_user_documents(self, user_id: UUID) -> list[Document]:
         return await self._repository.list_documents_by_user(user_id)

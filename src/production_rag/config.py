@@ -103,6 +103,28 @@ class Settings(BaseSettings):
         "of a PDF says little about its embedding cost.",
     )
 
+    # Background ingestion (arq worker)
+    redis_url: str = Field(
+        default="redis://localhost:6379/0",
+        description="Redis connection URL backing the ingestion job queue",
+    )
+    ingestion_batch_size: int = Field(
+        default=100,
+        description="Chunks embedded and committed per batch. Sets the resume "
+        "granularity (a failure loses at most this many chunks' work) and bounds "
+        "each embedding request, which the provider caps at 2048 inputs.",
+    )
+    ingestion_job_timeout_seconds: int = Field(
+        default=3600,
+        description="Maximum wall time for one ingestion job before the worker "
+        "kills it. Must exceed the slowest realistic document.",
+    )
+    ingestion_max_attempts: int = Field(
+        default=3,
+        description="Worker retries per job. Retries resume from the last "
+        "committed batch rather than restarting.",
+    )
+
     # Source connectors (ingest-by-URI)
     source_fetch_timeout_seconds: float = Field(
         default=120.0,

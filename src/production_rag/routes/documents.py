@@ -1,24 +1,28 @@
 from pathlib import Path
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, Form, UploadFile, status
 
 from production_rag.config import Settings, get_settings
-from production_rag.dependencies import get_current_user, get_document_service
-from production_rag.exceptions import FileTooLargeError
-from production_rag.ingestion.connectors import fetch_source
-from production_rag.ingestion.loaders import load_file
-from production_rag.ingestion.sources import (
-    build_upload_uri,
-    parse_source_uri,
-    source_display_name,
+from production_rag.dependencies import (
+    get_current_user,
+    get_document_service,
+    get_ingestion_job_repository,
+    get_job_queue,
 )
+from production_rag.exceptions import FileTooLargeError, UnsupportedFileTypeError
+from production_rag.ingestion.loaders import resolve_loader
+from production_rag.ingestion.sources import build_upload_uri, parse_source_uri
 from production_rag.models import User
+from production_rag.queue import JobQueue
+from production_rag.repositories.ingestion_job_repository import IngestionJobRepository
 from production_rag.schemas.document import (
     DocumentResponse,
     IngestFromUriRequest,
     QueryRequest,
     QueryResponse,
 )
+from production_rag.schemas.job import JobAcceptedResponse, JobStatusResponse
 from production_rag.services.document_service import DocumentService
 
 router = APIRouter(prefix="/documents", tags=["documents"])
@@ -26,85 +30,110 @@ router = APIRouter(prefix="/documents", tags=["documents"])
 
 @router.post(
     "/upload",
-    response_model=DocumentResponse,
-    status_code=status.HTTP_201_CREATED,
+    response_model=JobAcceptedResponse,
+    status_code=status.HTTP_202_ACCEPTED,
 )
 async def upload_file(
     file: UploadFile = File(...),
     title: str | None = Form(default=None),
     current_user: User = Depends(get_current_user),
-    service: DocumentService = Depends(get_document_service),
+    jobs: IngestionJobRepository = Depends(get_ingestion_job_repository),
+    queue: JobQueue = Depends(get_job_queue),
     settings: Settings = Depends(get_settings),
-) -> DocumentResponse:
-    """Ingest an uploaded file (PDF/DOCX/HTML/TXT/Markdown) into the RAG store."""
+) -> JobAcceptedResponse:
+    """Queue an uploaded file for ingestion.
+
+    Returns **202 with a job id**, not the finished document. Parsing and
+    embedding a large document takes minutes; doing it here would hold the
+    connection and a database transaction open for the duration, and lose every
+    completed embedding if it failed part-way. Poll
+    ``GET /documents/jobs/{job_id}`` for progress.
+
+    Cheap checks still run synchronously — an oversized or unreadable file is
+    rejected immediately rather than becoming a job that fails later.
+    """
     content = await file.read()
     if len(content) > settings.max_upload_bytes:
         raise FileTooLargeError(
             f"File exceeds the maximum upload size of {settings.max_upload_bytes} bytes."
         )
+    if resolve_loader(file.filename, file.content_type) is None:
+        raise UnsupportedFileTypeError(
+            f"Unsupported file type for '{file.filename}'. "
+            f"Supported: PDF, DOCX, HTML, TXT, Markdown."
+        )
 
-    # Raises UnsupportedFileTypeError (415) / ValidationError (422) on bad input.
-    segments = load_file(content, file.filename, file.content_type)
-
-    # Title defaults to the filename stem; an explicit form field overrides it.
     stem = Path(file.filename).stem if file.filename else "document"
-    doc_title = (title or stem or "document")[:255]
-
-    # source is the document's identity for (owner, source) replace-on-re-upload.
-    # It is a real URI, not the bare filename: the scheme records how the bytes
-    # arrived, so an uploaded report.pdf and one pulled from a URL of the same
-    # name stay distinct documents.
-    source = build_upload_uri(current_user.id, file.filename)
-
-    document = await service.ingest_segments(
-        title=doc_title,
-        segments=segments,
+    job = await jobs.create(
         user_id=current_user.id,
-        source=source,
+        # A real URI, so an uploaded report.pdf and one pulled from a URL of the
+        # same name remain distinct documents.
+        source=build_upload_uri(current_user.id, file.filename),
+        title=(title or stem or "document")[:255],
+        # The worker is a different process and cannot read this UploadFile, so
+        # the bytes are staged on the job row and cleared once it succeeds.
+        payload=content,
+        filename=file.filename,
+        content_type=file.content_type,
     )
-    return DocumentResponse.model_validate(document)
+    await queue.enqueue_ingestion(job.id)
+    return JobAcceptedResponse.model_validate(job)
 
 
 @router.post(
     "/ingest",
-    response_model=DocumentResponse,
-    status_code=status.HTTP_201_CREATED,
+    response_model=JobAcceptedResponse,
+    status_code=status.HTTP_202_ACCEPTED,
 )
 async def ingest_from_uri(
     data: IngestFromUriRequest,
     current_user: User = Depends(get_current_user),
-    service: DocumentService = Depends(get_document_service),
-    settings: Settings = Depends(get_settings),
-) -> DocumentResponse:
-    """Pull a document from an external source and ingest it.
+    jobs: IngestionJobRepository = Depends(get_ingestion_job_repository),
+    queue: JobQueue = Depends(get_job_queue),
+) -> JobAcceptedResponse:
+    """Queue an external source (https:// or gdrive://) for ingestion.
 
-    A one-shot pull: the URI is fetched now, parsed, and stored. There is no
-    background sync — re-ingesting means calling this again, which is cheap
-    because unchanged content short-circuits before any embedding work.
+    No bytes are staged: the URI can be fetched again, so the worker re-fetches
+    it. That keeps a 100 MiB blob out of the database for every source that has
+    an address.
 
-    The fetched URI *is* the document's identity, so re-pulling the same URI
-    replaces that document in place rather than creating a duplicate.
+    The URI is validated here so a malformed one is a 422 now, rather than a job
+    that fails asynchronously.
     """
-    # 422 on a malformed or non-fetchable scheme, before any network call.
     parsed = parse_source_uri(data.uri)
 
-    # 502 on upstream/blocked-address failures, 503 when a connector's
-    # credentials are absent, 413 if the body exceeds max_upload_bytes.
-    fetched = await fetch_source(parsed, settings)
-
-    # Identical dispatch to the upload path — connectors add sources, not formats.
-    segments = load_file(fetched.content, fetched.filename, fetched.content_type)
-
-    stem = Path(fetched.filename).stem or source_display_name(parsed)
-    doc_title = (data.title or stem or "document")[:255]
-
-    document = await service.ingest_segments(
-        title=doc_title,
-        segments=segments,
+    job = await jobs.create(
         user_id=current_user.id,
         source=parsed.uri,
+        title=data.title[:255] if data.title else None,
     )
-    return DocumentResponse.model_validate(document)
+    await queue.enqueue_ingestion(job.id)
+    return JobAcceptedResponse.model_validate(job)
+
+
+@router.get("/jobs", response_model=list[JobStatusResponse])
+async def list_jobs(
+    limit: int = 20,
+    current_user: User = Depends(get_current_user),
+    jobs: IngestionJobRepository = Depends(get_ingestion_job_repository),
+) -> list[JobStatusResponse]:
+    records = await jobs.list_for_owner(current_user.id, limit=min(limit, 100))
+    return [JobStatusResponse.model_validate(job) for job in records]
+
+
+@router.get("/jobs/{job_id}", response_model=JobStatusResponse)
+async def get_job(
+    job_id: UUID,
+    current_user: User = Depends(get_current_user),
+    jobs: IngestionJobRepository = Depends(get_ingestion_job_repository),
+) -> JobStatusResponse:
+    """Progress and outcome of one ingestion job.
+
+    Scoped to its owner: someone else's job id is a 404, not a 403, so the
+    endpoint does not confirm that an id exists.
+    """
+    job = await jobs.get_for_owner(job_id, current_user.id)
+    return JobStatusResponse.model_validate(job)
 
 
 @router.post("/query", response_model=QueryResponse)

@@ -7,6 +7,7 @@ from production_rag.dependencies import get_embedding_service, get_llm_client
 from production_rag.llm.client import LLMClient, LLMResponse
 from production_rag.llm.embedding_service import EmbeddingService
 from production_rag.main import app
+from tests._jobs import drain_jobs
 
 pytestmark = pytest.mark.asyncio(loop_scope="module")
 
@@ -34,7 +35,10 @@ def _mock_llm_client() -> LLMClient:
     return mock
 
 
-async def test_upload_document_returns_201(pg_async_client: AsyncClient) -> None:
+async def test_upload_document_creates_document_via_worker(
+    pg_async_client: AsyncClient, pg_session, job_queue
+) -> None:
+    """Upload is accepted (202), then the worker produces the document."""
     mock_emb = _mock_embedding_service()
     app.dependency_overrides[get_embedding_service] = lambda: mock_emb
 
@@ -62,15 +66,23 @@ async def test_upload_document_returns_201(pg_async_client: AsyncClient) -> None
         headers={"Authorization": f"Bearer {token}"},
     )
 
-    assert response.status_code == 201
-    data = response.json()
-    assert data["title"] == "Test Document"
-    assert data["chunk_count"] > 0
+    assert response.status_code == 202
+    assert response.json()["status"] == "pending"
+
+    await drain_jobs(pg_session, job_queue, mock_emb)
+
+    listed = await pg_async_client.get(
+        "/documents", headers={"Authorization": f"Bearer {token}"}
+    )
+    document = next(d for d in listed.json() if d["title"] == "Test Document")
+    assert document["chunk_count"] > 0
 
     app.dependency_overrides.pop(get_embedding_service, None)
 
 
-async def test_query_returns_answer_with_sources(pg_async_client: AsyncClient) -> None:
+async def test_query_returns_answer_with_sources(
+    pg_async_client: AsyncClient, pg_session, job_queue
+) -> None:
     mock_emb = _mock_embedding_service()
     mock_llm = _mock_llm_client()
     app.dependency_overrides[get_embedding_service] = lambda: mock_emb
@@ -100,6 +112,8 @@ async def test_query_returns_answer_with_sources(pg_async_client: AsyncClient) -
         },
         headers={"Authorization": f"Bearer {token}"},
     )
+    # Ingestion is async now — run the worker before the document is queryable.
+    await drain_jobs(pg_session, job_queue, mock_emb)
 
     # Query
     response = await pg_async_client.post(

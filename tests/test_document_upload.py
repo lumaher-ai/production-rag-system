@@ -11,6 +11,7 @@ from production_rag.llm.embedding_service import EmbeddingService
 from production_rag.main import app
 from production_rag.models.document import DocumentChunk
 from tests._file_builders import make_docx, make_pdf
+from tests._jobs import drain_jobs
 
 pytestmark = pytest.mark.asyncio(loop_scope="module")
 
@@ -21,6 +22,14 @@ def _mock_embedding_service() -> EmbeddingService:
     mock.embed_batch.side_effect = lambda texts: [[0.1] * 1536 for _ in texts]
     mock.model = "text-embedding-3-small"  # part of the idempotency key
     return mock
+
+
+async def _document_id_for(session: AsyncSession, source: str) -> UUID:
+    """Documents are created by the worker, so the id comes from the source URI."""
+    from production_rag.models.document import Document
+
+    result = await session.execute(select(Document.id).where(Document.source == source))
+    return result.scalar_one()
 
 
 async def _auth_token(client: AsyncClient, email: str) -> str:
@@ -35,7 +44,9 @@ async def _auth_token(client: AsyncClient, email: str) -> str:
     return login.json()["access_token"]
 
 
-async def test_upload_txt_returns_201(pg_async_client: AsyncClient) -> None:
+async def test_upload_txt_is_accepted_and_ingested(
+    pg_async_client: AsyncClient, pg_session: AsyncSession, job_queue
+) -> None:
     app.dependency_overrides[get_embedding_service] = _mock_embedding_service
     token = await _auth_token(pg_async_client, "txt@example.com")
 
@@ -45,18 +56,27 @@ async def test_upload_txt_returns_201(pg_async_client: AsyncClient) -> None:
         headers={"Authorization": f"Bearer {token}"},
     )
 
-    assert response.status_code == 201
-    data = response.json()
-    assert data["title"] == "notes"  # filename stem
-    assert data["chunk_count"] > 0
-    # source is a URI, not the bare filename: scheme + owner + filename.
-    assert data["source"].startswith("upload://")
-    assert data["source"].endswith("/notes.txt")
+    # 202: the work is queued, not done. source is a URI, not a bare filename.
+    assert response.status_code == 202
+    accepted = response.json()
+    assert accepted["source"].startswith("upload://")
+    assert accepted["source"].endswith("/notes.txt")
+
+    await drain_jobs(pg_session, job_queue)
+
+    listed = await pg_async_client.get(
+        "/documents", headers={"Authorization": f"Bearer {token}"}
+    )
+    document = next(d for d in listed.json() if d["source"] == accepted["source"])
+    assert document["title"] == "notes"  # filename stem
+    assert document["chunk_count"] > 0
 
     app.dependency_overrides.pop(get_embedding_service, None)
 
 
-async def test_upload_title_override(pg_async_client: AsyncClient) -> None:
+async def test_upload_title_override(
+    pg_async_client: AsyncClient, pg_session: AsyncSession, job_queue
+) -> None:
     app.dependency_overrides[get_embedding_service] = _mock_embedding_service
     token = await _auth_token(pg_async_client, "title@example.com")
 
@@ -67,14 +87,19 @@ async def test_upload_title_override(pg_async_client: AsyncClient) -> None:
         headers={"Authorization": f"Bearer {token}"},
     )
 
-    assert response.status_code == 201
-    assert response.json()["title"] == "Custom Title"
+    assert response.status_code == 202
+    await drain_jobs(pg_session, job_queue)
+
+    listed = await pg_async_client.get(
+        "/documents", headers={"Authorization": f"Bearer {token}"}
+    )
+    assert any(d["title"] == "Custom Title" for d in listed.json())
 
     app.dependency_overrides.pop(get_embedding_service, None)
 
 
 async def test_upload_pdf_persists_page_provenance(
-    pg_async_client: AsyncClient, pg_session: AsyncSession
+    pg_async_client: AsyncClient, pg_session: AsyncSession, job_queue
 ) -> None:
     app.dependency_overrides[get_embedding_service] = _mock_embedding_service
     token = await _auth_token(pg_async_client, "pdf@example.com")
@@ -86,12 +111,13 @@ async def test_upload_pdf_persists_page_provenance(
         headers={"Authorization": f"Bearer {token}"},
     )
 
-    assert response.status_code == 201
-    doc_id = response.json()["id"]
+    assert response.status_code == 202
+    await drain_jobs(pg_session, job_queue)
+    doc_id = await _document_id_for(pg_session, response.json()["source"])
 
     # Chunks share the request's session (conftest override) — page must be set.
     result = await pg_session.execute(
-        select(DocumentChunk.page).where(DocumentChunk.document_id == UUID(doc_id))
+        select(DocumentChunk.page).where(DocumentChunk.document_id == doc_id)
     )
     pages = {row[0] for row in result.all()}
     assert pages == {1, 2}
@@ -100,7 +126,7 @@ async def test_upload_pdf_persists_page_provenance(
 
 
 async def test_upload_docx_persists_section_provenance(
-    pg_async_client: AsyncClient, pg_session: AsyncSession
+    pg_async_client: AsyncClient, pg_session: AsyncSession, job_queue
 ) -> None:
     app.dependency_overrides[get_embedding_service] = _mock_embedding_service
     token = await _auth_token(pg_async_client, "docx@example.com")
@@ -118,11 +144,12 @@ async def test_upload_docx_persists_section_provenance(
         headers={"Authorization": f"Bearer {token}"},
     )
 
-    assert response.status_code == 201
-    doc_id = response.json()["id"]
+    assert response.status_code == 202
+    await drain_jobs(pg_session, job_queue)
+    doc_id = await _document_id_for(pg_session, response.json()["source"])
 
     result = await pg_session.execute(
-        select(DocumentChunk.section).where(DocumentChunk.document_id == UUID(doc_id))
+        select(DocumentChunk.section).where(DocumentChunk.document_id == doc_id)
     )
     sections = {row[0] for row in result.all()}
     assert "Introduction" in sections
@@ -130,7 +157,9 @@ async def test_upload_docx_persists_section_provenance(
     app.dependency_overrides.pop(get_embedding_service, None)
 
 
-async def test_upload_unsupported_type_returns_415(pg_async_client: AsyncClient) -> None:
+async def test_upload_unsupported_type_returns_415(
+    pg_async_client: AsyncClient, job_queue
+) -> None:
     app.dependency_overrides[get_embedding_service] = _mock_embedding_service
     token = await _auth_token(pg_async_client, "unsupported@example.com")
 
@@ -145,7 +174,9 @@ async def test_upload_unsupported_type_returns_415(pg_async_client: AsyncClient)
     app.dependency_overrides.pop(get_embedding_service, None)
 
 
-async def test_upload_oversized_returns_413(pg_async_client: AsyncClient) -> None:
+async def test_upload_oversized_returns_413(
+    pg_async_client: AsyncClient, job_queue
+) -> None:
     from production_rag.config import get_settings
 
     app.dependency_overrides[get_embedding_service] = _mock_embedding_service

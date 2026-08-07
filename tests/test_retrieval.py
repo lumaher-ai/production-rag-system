@@ -10,7 +10,9 @@ from production_rag.models import User
 from production_rag.repositories.document_repository import DocumentRepository
 from production_rag.repositories.query_cache_repository import QueryCacheRepository
 from production_rag.services.auth_service import hash_password
+from production_rag.repositories.ingestion_job_repository import IngestionJobRepository
 from production_rag.services.document_service import DocumentService, ScoredChunk
+from production_rag.services.ingestion_service import IngestionService
 
 pytestmark = pytest.mark.asyncio(loop_scope="module")
 
@@ -48,11 +50,18 @@ async def test_retrieve_returns_scored_chunks_without_llm(pg_session: AsyncSessi
     pg_session.add(user)
     await pg_session.flush()
 
-    await service.ingest_segments(
+    # Seed through the real ingestion path (no job row — the caller owns the
+    # transaction), so retrieval is tested against production-shaped data.
+    await IngestionService(
+        document_repository=DocumentRepository(pg_session),
+        embedding_service=emb,
+        query_cache_repository=QueryCacheRepository(pg_session),
+        job_repository=IngestionJobRepository(pg_session),
+    ).ingest_now(
         title="KB",
         segments=[ExtractedSegment(text="pgvector powers similarity search. " * 40)],
         user_id=user.id,
-        source="kb.txt",
+        source=f"upload://{user.id}/kb.txt",
     )
 
     results = await service.retrieve(

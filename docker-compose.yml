@@ -16,5 +16,22 @@ services:
       timeout: 5s
       retries: 5
 
+  redis:
+    image: redis:7-alpine
+    container_name: paddington-redis
+    ports:
+      - "6379:6379"
+    # Append-only persistence: an enqueued ingestion job that is lost on restart
+    # leaves a row stuck in 'pending' with no worker coming for it.
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - paddington_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
 volumes:
   paddington_postgres_data:
+  paddington_redis_data:
