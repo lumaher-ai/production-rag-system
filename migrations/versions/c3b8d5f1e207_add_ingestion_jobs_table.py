@@ -57,6 +57,10 @@ def upgrade() -> None:
         sa.Column("document_id", sa.Uuid(), nullable=True),
         sa.Column("error", sa.Text(), nullable=True),
         sa.Column("attempts", sa.Integer(), nullable=False, server_default="0"),
+        # Liveness signal. A worker killed outright never records a failure, so
+        # a stale heartbeat is the only way to distinguish a dead job from a
+        # slow one and hand it back to the queue.
+        sa.Column("heartbeat_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("started_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("finished_at", sa.DateTime(timezone=True), nullable=True),

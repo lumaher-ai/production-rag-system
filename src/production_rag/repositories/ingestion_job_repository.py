@@ -1,7 +1,7 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from production_rag.exceptions import NotFoundError
@@ -91,16 +91,49 @@ class IngestionJobRepository:
         )
         return list(result.scalars().all())
 
+    async def find_stale_running(
+        self, older_than_seconds: int, limit: int = 50
+    ) -> list[IngestionJob]:
+        """Jobs stuck in 'running' whose worker has stopped reporting progress.
+
+        A worker killed by SIGKILL, an OOM, or a pod eviction never reaches its
+        failure handler, so its job stays 'running' with nobody working on it and
+        nothing to retry it. A heartbeat older than one batch's realistic
+        duration is the signal that the owning worker is gone.
+
+        The cutoff must exceed the time one batch can take, or a slow-but-healthy
+        job would be handed to a second worker and both would write the same
+        chunks.
+        """
+        cutoff = datetime.now(UTC) - timedelta(seconds=older_than_seconds)
+        result = await self._session.execute(
+            select(IngestionJob)
+            .where(
+                IngestionJob.status == JobStatus.RUNNING.value,
+                # NULL predates the heartbeat column; treat it as stale so old
+                # rows are not stranded forever.
+                or_(
+                    IngestionJob.heartbeat_at.is_(None),
+                    IngestionJob.heartbeat_at < cutoff,
+                ),
+            )
+            .order_by(IngestionJob.created_at)
+            .limit(limit)
+        )
+        return list(result.scalars().all())
+
     async def mark_running(self, job: IngestionJob) -> IngestionJob:
         """Claim the job for this attempt.
 
         ``attempts`` increments here rather than on failure so that a worker
         killed mid-job (which never reaches a failure handler) is still counted.
         """
+        now = datetime.now(UTC)
         job.status = JobStatus.RUNNING.value
         job.attempts += 1
         job.error = None
-        job.started_at = job.started_at or datetime.now(UTC)
+        job.started_at = job.started_at or now
+        job.heartbeat_at = now
         await self._session.commit()
         return job
 
@@ -124,8 +157,11 @@ class IngestionJobRepository:
 
         Called once per batch, inside the same transaction as that batch's chunk
         rows, so the cursor can never claim more progress than was persisted.
+        Doubles as the liveness heartbeat: a job making batch progress is
+        demonstrably alive, so the sweeper leaves it alone.
         """
         job.processed_chunks = processed_chunks
+        job.heartbeat_at = datetime.now(UTC)
         await self._session.commit()
         return job
 

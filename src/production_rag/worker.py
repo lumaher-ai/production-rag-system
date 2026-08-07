@@ -17,13 +17,14 @@ load_dotenv()
 from typing import Any
 from uuid import UUID
 
+from arq import cron
 from arq.connections import RedisSettings
 
 from production_rag.config import get_settings
 from production_rag.database import close_db, get_session, init_db
 from production_rag.llm.embedding_service import EmbeddingService
 from production_rag.logging_config import configure_logging, get_logger
-from production_rag.queue import INGEST_TASK
+from production_rag.queue import INGEST_TASK, ArqJobQueue
 from production_rag.repositories.document_repository import DocumentRepository
 from production_rag.repositories.ingestion_job_repository import (
     IngestionJobRepository,
@@ -82,6 +83,39 @@ async def ingest_document(ctx: dict[str, Any], job_id: str) -> str:
         return str(document.id) if document else ""
 
 
+async def recover_stale_jobs(ctx: dict[str, Any]) -> int:
+    """Re-queue jobs whose worker died without recording a failure.
+
+    arq retries a task that *raises*. It does not rescue one whose worker was
+    killed outright — SIGKILL, an OOM, a pod eviction — because nothing is left
+    to report the failure. Verified: after `kill -9` mid-job, the row stays
+    'running' and no retry ever comes. Without this sweep, "resumable" would be
+    true of the design and false of the system.
+
+    Staleness is measured by heartbeat, not start time, so a legitimately slow
+    job is left alone. Re-queued jobs resume from their committed cursor, so a
+    recovered job repeats no completed work.
+    """
+    settings = get_settings()
+    async with get_session() as session:
+        jobs = IngestionJobRepository(session)
+        stale = await jobs.find_stale_running(settings.ingestion_stale_after_seconds)
+        if not stale:
+            return 0
+
+        queue = ArqJobQueue(ctx["redis"])
+        for job in stale:
+            logger.warning(
+                "ingestion_job_recovered",
+                job_id=str(job.id),
+                processed_chunks=job.processed_chunks,
+                total_chunks=job.total_chunks,
+                attempts=job.attempts,
+            )
+            await queue.enqueue_ingestion(job.id)
+        return len(stale)
+
+
 async def startup(ctx: dict[str, Any]) -> None:
     await init_db()
     logger.info("worker_started")
@@ -103,7 +137,11 @@ _settings = get_settings()
 class WorkerSettings:
     """arq reads these as plain class attributes at worker startup."""
 
-    functions = [ingest_document]
+    functions = [ingest_document, recover_stale_jobs]
+    # Sweeps for jobs orphaned by a killed worker. Runs on every worker, but the
+    # sweep is idempotent — a re-queued job resumes from its cursor, and a job
+    # already picked up has a fresh heartbeat and so is no longer stale.
+    cron_jobs = [cron(recover_stale_jobs, minute=set(range(0, 60, 2)), run_at_startup=True)]
     on_startup = startup
     on_shutdown = shutdown
 

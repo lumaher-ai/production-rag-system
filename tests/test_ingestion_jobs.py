@@ -7,6 +7,7 @@ missing chunks if the cursor and the chunk indices ever disagree. Several tests
 below exist specifically to pin that down.
 """
 
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
@@ -494,3 +495,117 @@ async def test_jobs_endpoints_require_auth(pg_async_client: AsyncClient) -> None
     assert (await pg_async_client.get("/documents/jobs")).status_code == 401
     assert (await pg_async_client.get(f"/documents/jobs/{uuid4()}")).status_code == 401
 
+
+
+# ─── Orphan recovery: a worker that dies never records a failure ───
+
+
+async def test_stale_running_job_is_detected(pg_session: AsyncSession) -> None:
+    """A killed worker leaves 'running' with a frozen heartbeat.
+
+    arq only retries a task that *raises*; a SIGKILL'd worker raises nothing, so
+    without this detection the job would sit in 'running' forever with no one
+    working on it.
+    """
+    user = await _make_user(pg_session, "stale@example.com")
+    jobs = IngestionJobRepository(pg_session)
+    job = await jobs.create(
+        user_id=user.id,
+        source=f"upload://{user.id}/stale.txt",
+        payload=LONG_TEXT.encode(),
+        filename="stale.txt",
+        content_type="text/plain",
+    )
+    await jobs.mark_running(job)
+
+    # Freeze the heartbeat in the past, as a dead worker would leave it.
+    job.heartbeat_at = datetime.now(UTC) - timedelta(seconds=600)
+    await pg_session.commit()
+
+    stale = await jobs.find_stale_running(older_than_seconds=300)
+    assert job.id in {j.id for j in stale}
+
+
+async def test_healthy_running_job_is_not_reclaimed(pg_session: AsyncSession) -> None:
+    """A slow but live job must not be handed to a second worker.
+
+    Two workers on one job would both resume from the same cursor and write the
+    same chunks — so the heartbeat, not elapsed time, is what decides.
+    """
+    user = await _make_user(pg_session, "healthy@example.com")
+    jobs = IngestionJobRepository(pg_session)
+    job = await jobs.create(
+        user_id=user.id,
+        source=f"upload://{user.id}/healthy.txt",
+        payload=LONG_TEXT.encode(),
+        filename="healthy.txt",
+        content_type="text/plain",
+    )
+    await jobs.mark_running(job)
+    # Started long ago, but still checkpointing — i.e. alive.
+    job.started_at = datetime.now(UTC) - timedelta(hours=2)
+    await jobs.advance(job, 50)
+
+    stale = await jobs.find_stale_running(older_than_seconds=300)
+    assert job.id not in {j.id for j in stale}
+
+
+async def test_advance_refreshes_the_heartbeat(pg_session: AsyncSession) -> None:
+    """Batch progress is the liveness signal, so it must move the heartbeat."""
+    user = await _make_user(pg_session, "heartbeat@example.com")
+    jobs = IngestionJobRepository(pg_session)
+    job = await jobs.create(
+        user_id=user.id,
+        source=f"upload://{user.id}/hb.txt",
+        payload=LONG_TEXT.encode(),
+        filename="hb.txt",
+        content_type="text/plain",
+    )
+    await jobs.mark_running(job)
+    job.heartbeat_at = datetime.now(UTC) - timedelta(seconds=600)
+    await pg_session.commit()
+
+    await jobs.advance(job, 10)
+
+    assert job.heartbeat_at > datetime.now(UTC) - timedelta(seconds=30)
+
+
+async def test_recovered_job_resumes_rather_than_restarting(
+    pg_session: AsyncSession,
+) -> None:
+    """End state of the orphan path: recovery must not re-embed finished work."""
+    user = await _make_user(pg_session, "recovered@example.com")
+    jobs = IngestionJobRepository(pg_session)
+    job = await jobs.create(
+        user_id=user.id,
+        source=f"upload://{user.id}/rec.txt",
+        payload=LONG_TEXT.encode(),
+        filename="rec.txt",
+        content_type="text/plain",
+    )
+
+    # Attempt 1 is killed outright: progress is committed, no failure recorded,
+    # status left at 'running' — exactly what `kill -9` leaves behind.
+    killed = _service(pg_session, _mock_embeddings(fail_after=25), batch_size=10)
+    with pytest.raises(RuntimeError):
+        await killed.run_job(job, get_settings())
+    await pg_session.rollback()
+    assert job.status == JobStatus.RUNNING.value
+    orphaned_at = job.processed_chunks
+    assert orphaned_at > 0
+
+    # The sweeper re-queues it; the worker picks it up again.
+    job.heartbeat_at = datetime.now(UTC) - timedelta(seconds=600)
+    await pg_session.commit()
+    assert job.id in {j.id for j in await jobs.find_stale_running(300)}
+
+    retry_embeddings = _mock_embeddings()
+    document = await _service(pg_session, retry_embeddings, batch_size=10).run_job(
+        job, get_settings()
+    )
+
+    assert document is not None
+    assert job.status == JobStatus.SUCCEEDED.value
+    embedded = sum(len(c.args[0]) for c in retry_embeddings.embed_batch.call_args_list)
+    assert embedded == job.total_chunks - orphaned_at
+    assert await _count_chunks(pg_session, document.id) == job.total_chunks

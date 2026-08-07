@@ -43,10 +43,20 @@ It is **not yet a "production" RAG system**, and this README won't pretend other
 
 ```mermaid
 flowchart LR
-    A[Text document<br/>JSON payload] --> B[RecursiveCharacterTextSplitter<br/>1000 chars / 200 overlap]
-    B --> C[Embed chunks in one batch<br/>text-embedding-3-small · 1536-d]
+    U[Upload file<br/>or ingest URI] --> API[POST /documents/upload<br/>POST /documents/ingest]
+    API -->|"validate size + type"| JOB[(ingestion_jobs<br/>pending)]
+    API -->|202 job_id| U
+    JOB --> Q{{Redis / arq}}
+    Q --> W[Worker]
+    W --> L[Load: PDF · DOCX · HTML · MD<br/>page &amp; section provenance]
+    L --> B[RecursiveCharacterTextSplitter<br/>1000 chars / 200 overlap]
+    B --> C[Embed + commit<br/>in batches of 100]
+    C -->|checkpoint each batch| JOB
     C --> D[(Postgres + pgvector<br/>documents · document_chunks)]
 ```
+
+A killed worker resumes from its last committed batch: chunking is deterministic, so
+`processed_chunks` doubles as a resume cursor. Poll `GET /documents/jobs/{job_id}` for progress.
 
 ### Query pipeline (RAG)
 
@@ -81,23 +91,24 @@ Honest inventory, verified against the source. ✅ = implemented and running · 
 
 | Stage | Status | What's there now | The production gap |
 |---|:---:|---|---|
-| **Document ingestion** | ✅ | `POST /documents/upload` (multipart) — PDF / DOCX / HTML / Markdown / text via a MIME→loader registry, emitting segments with page & section provenance | Synchronous with the request (holds a transaction across the whole embed); no normalization pass; no quality gate against scanned/empty PDFs |
+| **Document ingestion** | ✅ | `POST /documents/upload` (multipart) and `POST /documents/ingest` (`https://`, `gdrive://`) — PDF / DOCX / HTML / Markdown / text via a MIME→loader registry, emitting segments with page & section provenance | No normalization pass; no quality gate against scanned/empty PDFs |
+| **Async ingestion** | ✅ | Redis + **arq** worker, `ingestion_jobs` table, `202 + job_id`, `GET /documents/jobs/{id}`. Embeds in batches of 100, checkpointing each — a killed worker resumes from its cursor instead of re-embedding. Orphaned jobs reclaimed by a heartbeat sweeper | Failed jobs retain their payload with no retention policy; no dead-letter surface; polling rather than SSE |
 | **Idempotency** | ✅ | `(user_id, source)` identity, DB-enforced; `content_hash` + `chunker_version` + `embedding_model` gating; unchanged re-upload costs zero embedding calls; race-safe via savepoint | No cross-document dedup; no delete path, so the corpus only grows |
 | **Chunking** | ⚠️ | One recursive splitter (1000 / 200 chars), applied **per structural segment** so chunks never straddle a page or heading; `char_start` / `char_end` / `page` / `section` populated | Single fixed strategy, never compared; sized in characters while every downstream budget is in tokens; no re-chunk backfill |
-| **Embedding** | ⚠️ | LiteLLM, `text-embedding-3-small`, 1536-d, config-wired, batched, cost-logged | Model chosen by default, never benchmarked; `Vector(1536)` hardcoded against a swappable setting; unbounded batch size; no chunk-level cache |
+| **Embedding** | ⚠️ | LiteLLM, `text-embedding-3-small`, 1536-d, config-wired, batched in bounded groups of 100, cost-logged | Model chosen by default, never benchmarked; `Vector(1536)` hardcoded against a swappable setting; no chunk-level cache |
 | **Vector store** | ✅ | Postgres + pgvector, **HNSW index** (`vector_cosine_ops`, `m=16`, `ef_construction=64`, set explicitly and documented in the migration) | Params untuned against eval metrics; `hnsw.ef_search` never set; the `owner_id` filter degrades ANN recall (see [D3](docs/rag-production-decisions.md)) |
 | **Retrieval** | ⚠️ | Dense cosine top-k, user-scoped, **similarity scores returned**; `retrieve()` split out from `query()` so it's measurable without an LLM | Vector-only — no hybrid/keyword, so exact-match queries have no working path; no metadata filters; no score threshold or abstention |
 | **Reranking** | ❌ | — | No second-stage reranker or rank fusion |
 | **Generation** | ✅ | Grounded prompt, per-source citations with scores, cost tracking, provider fallback, TTL answer cache that evals can bypass | No streaming; no claim-level citation mapping; prompt is unversioned and absent from the cache key |
 | **Evaluation** | ❌ | — | No dataset, no retrieval/generation metrics, no regression gate. **This is why five rows above are ⚠️ rather than ✅.** |
-| **API** | ⚠️ | Upload / query / list, JWT-auth | No delete, no streaming endpoint, no ingestion status, no rate limiting, unbounded `top_k` |
-| **Deployment** | ⚠️ | `docker-compose` runs Postgres | No app Dockerfile, no CI/CD, no live deploy, no real readiness probe |
+| **API** | ⚠️ | Upload / ingest-by-URI / query / list / job status, JWT-auth | No delete, no streaming endpoint, no rate limiting, unbounded `top_k` |
+| **Deployment** | ⚠️ | `docker-compose` runs Postgres + Redis | No app or worker Dockerfile, no CI/CD, no live deploy, no real readiness probe |
 
 ---
 
 ## 🚀 Quickstart
 
-**Prerequisites:** Python 3.12+, [`uv`](https://github.com/astral-sh/uv), Docker (for Postgres), and an OpenAI API key.
+**Prerequisites:** Python 3.12+, [`uv`](https://github.com/astral-sh/uv), Docker (Postgres + Redis), and an OpenAI API key.
 
 ```bash
 # 1. Clone and install
@@ -108,13 +119,16 @@ uv sync
 cp .env.example .env
 # edit .env → set OPENAI_API_KEY (and ANTHROPIC_API_KEY for the fallback model)
 
-# 3. Start Postgres (pgvector image)
+# 3. Start Postgres (pgvector) and Redis
 docker compose up -d
 
 # 4. Run database migrations
 uv run alembic upgrade head
 
-# 5. Launch the API
+# 5. Start the ingestion worker (separate terminal)
+uv run arq production_rag.worker.WorkerSettings
+
+# 6. Launch the API
 uv run uvicorn production_rag.main:app --reload
 ```
 
@@ -201,6 +215,7 @@ Sequenced by *what unblocks the most other decisions*. Every remaining choice �
 
 - ✅ **Phase 1 — Make retrieval production-correct** · HNSW index (`vector_cosine_ops`), similarity scores returned, N+1 title lookups removed by denormalization, chunk provenance columns.
 - ✅ **Phase 2 — Ingestion** · Multi-format file loaders (PDF/DOCX/HTML/MD), content hashing for idempotent re-ingestion, transactional in-place replace. *(Pluggable chunkers and the embedding cache remain open.)*
+- ✅ **A2 — Async ingestion** · Redis/arq queue, job status table, batch checkpointing with resume, orphan recovery. Upload of a large document returns in ~80ms instead of ~40–60s.
 - 🔜 **Tier 0 — Correctness first** · Six defects that only surface under production conditions: filtered-ANN recall collapse under multi-tenancy, mixed embedding models ranking silently, hardcoded vector dimension, an unimplemented `filters` parameter, unbounded context, default JWT secret.
 - 🔜 **Tier 1 — Evaluation pipeline** · Golden Q/A + gold-context dataset stratified by query type, retrieval metrics (Recall@k, MRR, nDCG), generation metrics (faithfulness, relevance, correctness), CI regression gate. **Everything below is a guess until this exists.**
 - **Tier 2 — Hybrid retrieval + reranking** · `tsvector` keyword search, Reciprocal Rank Fusion, cross-encoder reranker (retrieve top-30 → rerank to top-5), abstention threshold — each adopted only if the numbers justify it.
@@ -226,7 +241,7 @@ These are tracked, not hidden — each maps to a decision in the [decision repor
 - **No evaluation** → retrieval and answer quality are not measured, which is why the chunk size, the embedding model, and the HNSW parameters are defaults rather than defended choices. This is the top priority, not the last phase. *(Part G)*
 - **Vector-only retrieval** → no keyword/hybrid channel, so exact-match queries (IDs, acronyms, proper nouns) have no working retrieval path; no reranking precision lift. *(E2, E5)*
 - **Filtered-ANN recall** → pgvector applies the `owner_id` filter *after* the HNSW graph walk, so a multi-tenant query can silently return fewer results than requested. Correctness bug, not a tuning knob. *(D3)*
-- **Synchronous ingestion** → a large PDF embeds inline in the request, holding a transaction open for its duration. *(A2)*
+- **Non-atomic ingestion** → per-batch commits are what make a job resumable, so a document is briefly visible to retrieval while it is still being ingested. Harmless when new; during a *replace* that document has reduced content until the job finishes. *(A2)*
 - **Denormalized chunk titles** → each chunk stores a copy of its document title for fast retrieval, so a future document-rename endpoint must also update those copies.
 
 ---

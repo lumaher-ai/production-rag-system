@@ -40,9 +40,14 @@ class ArqJobQueue:
         self._pool = pool
 
     async def enqueue_ingestion(self, job_id: UUID) -> None:
-        # _job_id ties the arq job to our row, so a duplicate enqueue of the same
-        # ingestion job is dropped by arq rather than running twice.
-        await self._pool.enqueue_job(INGEST_TASK, str(job_id), _job_id=f"ingest:{job_id}")
+        # Deliberately no arq ``_job_id``. Setting it to a value derived from the
+        # ingestion job id makes arq treat a *re-enqueue as a duplicate and drop
+        # it silently* — which breaks the retry of an orphaned job, the one case
+        # the retry path exists for. Deduplication is not needed here anyway:
+        # every request mints a fresh job row with its own UUID, and running the
+        # same job twice is harmless because ingestion is idempotent (content
+        # hash) and resumable (the progress cursor).
+        await self._pool.enqueue_job(INGEST_TASK, str(job_id))
         logger.info("ingestion_job_enqueued", job_id=str(job_id))
 
 

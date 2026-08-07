@@ -76,6 +76,14 @@ class IngestionJob(Base):
     )
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # Liveness signal, refreshed when the job is claimed and after every batch.
+    # A worker killed outright (SIGKILL, OOM, pod eviction) never runs its
+    # failure handler, so its job would otherwise sit in 'running' forever with
+    # nothing to retry it. The sweeper uses a stale heartbeat to tell "died" from
+    # "still working", which a single started_at timestamp cannot express.
+    heartbeat_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

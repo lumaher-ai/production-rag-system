@@ -124,6 +124,14 @@ class Settings(BaseSettings):
         description="Worker retries per job. Retries resume from the last "
         "committed batch rather than restarting.",
     )
+    ingestion_stale_after_seconds: int = Field(
+        default=300,
+        description="A 'running' job whose heartbeat is older than this is "
+        "presumed orphaned (worker killed without recording a failure) and is "
+        "re-queued. Must exceed the time one batch can take, or a slow but "
+        "healthy job would be handed to a second worker and both would write "
+        "the same chunks.",
+    )
 
     # Source connectors (ingest-by-URI)
     source_fetch_timeout_seconds: float = Field(

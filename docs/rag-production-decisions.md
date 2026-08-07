@@ -111,17 +111,55 @@ What remains is: retrieval quality (Part E), the measurement layer that would ju
 
 ### A2. Is ingestion synchronous with the request, or queued?
 
-- **State:** ❌ — **the most under-appreciated gap in the repo.**
-- **Now:** `POST /documents/upload` runs load → chunk → *embed the entire document* → write, inline
-  in the HTTP request, in one transaction. A 10 MiB PDF (`max_upload_bytes`) is thousands of chunks
-  and a multi-second-to-minute embedding call, holding a DB transaction open the whole time.
-- **Options:** (a) keep synchronous; (b) background task (FastAPI `BackgroundTasks`); (c) real queue
-  (Celery/arq/Redis) with an `ingestion_jobs` table and a status endpoint; (d) durable workflow.
-- **Call:** **(c)**, with an `ingestion_jobs` row (`pending → running → succeeded/failed`, error
-  text, chunk counts) and `GET /documents/{id}/status`. This is the decision that makes the system
-  survive a real corpus. It also unlocks retry-on-partial-failure, which (a) cannot express.
-- **Proof:** P95 upload latency for a 200-page PDF; transaction-duration histogram; ingestion
-  success rate and mean retries per document.
+- **State:** ✅ **DECIDED & IMPLEMENTED (2026-08-07)** — Redis-backed queue (**arq**), an
+  `ingestion_jobs` table, batch checkpointing with resume, and `202 + job_id`.
+- **Was:** `POST /documents/upload` ran load → chunk → embed *every* chunk → write inline in the
+  HTTP request, in one transaction. Measured on a real 384-page PDF: 21s fetch + 12s parse +
+  embedding, ~40–60s with the transaction held open throughout. A failure at chunk 847 of 1200
+  discarded all 846 completed embeddings.
+- **Decision taken:** (c). Both ingestion endpoints now record a job and return; a worker drives it.
+  - **Queue: arq, not Celery.** The stack is async end to end, so arq tasks are plain `async def`
+    and `IngestionService` is reused unchanged. Celery is sync-first and would need `asyncio.run()`
+    per task or a gevent pool — an adapter layer wrapped around the actual work. Celery's name
+    recognition is real; being able to say *why not Celery* is the better signal.
+  - **Payload staging: Postgres `bytea` on the job row.** A worker cannot read the request's
+    `UploadFile`. Bytes stage transactionally with the job and are cleared on success. Connector
+    sources (`https://`, `gdrive://`) stage nothing — the worker re-fetches the URI, so a 100 MiB
+    blob never touches the database for any source that has an address.
+  - **Resume: batch checkpointing.** Chunks are embedded and committed 100 at a time, advancing
+    `processed_chunks`. **Chunking is deterministic** for a given (content, `chunker_version`), so a
+    retry re-derives the same chunk list and skips that many — resume needs no persisted chunk text,
+    only the counter. `chunker_version` is stored per job; if it moves between attempts the cursor is
+    meaningless and the job restarts from zero rather than splicing two chunkings together.
+- **This also closed C4.** Batching bounds each embedding request; the previous code sent every
+  chunk of a document in one call with no cap.
+- **Two defects found by end-to-end testing, not by the test suite** — both worth more than the
+  feature itself as evidence of what verification catches:
+  1. **arq does not rescue a job whose worker was killed.** `retry_jobs` covers a task that *raises*;
+     a `kill -9` raises nothing, so the row sat in `running` forever with no retry ever coming.
+     Fixed with a `heartbeat_at` column and a `recover_stale_jobs` cron that re-queues jobs whose
+     heartbeat has gone stale. Staleness is measured by heartbeat, not elapsed time — using
+     `started_at` would hand a slow-but-healthy job to a second worker, and both would write the
+     same chunks.
+  2. **The arq `_job_id` dedup key silently dropped legitimate re-enqueues.** Set to
+     `ingest:<job_id>`, it made arq treat a retry of an orphaned job as a duplicate and discard it —
+     breaking the one path retries exist for. Removed: every request already mints a unique job row,
+     and running a job twice is harmless because ingestion is idempotent and resumable.
+- **Trade-off accepted:** ingestion is no longer atomic. Per-batch commits are what make resume
+  possible, so a document under ingestion is partially visible to retrieval. Harmless for a new
+  document (progressive availability); for a *replace*, old chunks drop on the first attempt so that
+  document has reduced content until the job finishes. The clean fix is an `is_ready` flag filtered
+  at retrieval, deferred because it forces a join into the hot ANN query and interacts with **D3**.
+- **Proof (measured, not asserted):** upload of a 512 KB document returned in **0.083s** versus
+  ~40–60s synchronously. Worker logs show batch commits at 100/200/…/667. Under `kill -9` at
+  200/750, the job was reclaimed by the sweeper, resumed at 300 (not 0), and the final document held
+  **750 chunks with 750 distinct indexes, 0→749** — no duplicates, no gaps, `attempts=2`, payload
+  cleared. 19 tests cover the lifecycle, resume, chunker-change restart, orphan detection, and
+  owner isolation.
+- **Follow-ups this opened:** failed jobs retain their payload (so a retry needs no re-upload) and
+  therefore need a retention policy; a dead-letter surface once jobs accumulate; job cancellation;
+  progress via SSE instead of polling; and the A1 folder case — `gdrive://<folder_id>` fanning out
+  to one job per file is natural now that a queue exists.
 
 ### A3. What normalization is applied before embedding?
 
