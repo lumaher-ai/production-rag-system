@@ -11,6 +11,11 @@ class EmbeddingService:
     def __init__(self, model: str = "text-embedding-3-small") -> None:
         self._model = model
 
+    @property
+    def model(self) -> str:
+        """The embedding model name — part of every idempotency key."""
+        return self._model
+
     async def embed_text(self, text: str) -> list[float]:
         result = await self.embed_batch([text])
         return result[0]

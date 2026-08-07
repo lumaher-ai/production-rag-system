@@ -25,3 +25,11 @@ class ValidationError(PaddingtonError):
 
 class ForbiddenError(PaddingtonError):
     status_code = status.HTTP_403_FORBIDDEN
+
+
+class UnsupportedFileTypeError(PaddingtonError):
+    status_code = status.HTTP_415_UNSUPPORTED_MEDIA_TYPE
+
+
+class FileTooLargeError(PaddingtonError):
+    status_code = status.HTTP_413_CONTENT_TOO_LARGE

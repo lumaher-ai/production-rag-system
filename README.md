@@ -18,9 +18,9 @@
 
 ## TL;DR
 
-This repo implements the **RAG happy path end-to-end**: ingest text → chunk → embed → store in pgvector → retrieve by cosine similarity → ground an LLM answer with source citations and per-request cost tracking. It runs today.
+This repo implements the **RAG pipeline end-to-end**: upload a PDF/DOCX/HTML/Markdown file → extract with page & section provenance → chunk → embed → store in pgvector behind an **HNSW index** → retrieve by cosine similarity with scores → ground an LLM answer with source citations and per-request cost tracking. Re-uploading an unchanged source is a genuine no-op; an edited one is replaced transactionally. It runs today.
 
-It is **not yet a "production" RAG system**, and this README won't pretend otherwise. There is no vector index (every query is a sequential scan), no file loaders, no reranking, no hybrid search, and no evaluation harness. The [roadmap](#-roadmap) below is the plan to close that gap — and the [full technical report](docs/rag-production-roadmap.md) is the gap analysis behind it.
+It is **not yet a "production" RAG system**, and this README won't pretend otherwise. There is no reranking, no hybrid/keyword search, and — most importantly — **no evaluation harness**, which means the chunk size, the embedding model, and the index parameters are all defaults rather than defended choices. The [decision report](docs/rag-production-decisions.md) enumerates what's left as ~49 explicit engineering decisions, including several correctness bugs that only surface under multi-tenant load.
 
 > **Why build it this way?** A convincing engineering artifact isn't a demo that hides its seams — it's a system with a clear boundary between *what's built*, *what's measured*, and *what's next*. That boundary is the whole point of this repo.
 
@@ -77,20 +77,21 @@ flowchart TD
 
 ## 📊 Status: what works today
 
-Honest inventory. ✅ = implemented and running · ⚠️ = works but MVP-only · ❌ = not built yet (see [roadmap](#-roadmap)).
+Honest inventory, verified against the source. ✅ = implemented and running · ⚠️ = works, but the choice is a default rather than a measured decision · ❌ = not built yet. Per-stage detail in the [decision report](docs/rag-production-decisions.md).
 
 | Stage | Status | What's there now | The production gap |
 |---|:---:|---|---|
-| **Document ingestion** | ⚠️ | `POST /documents` — raw text via JSON | No file upload; no PDF/DOCX/HTML/Markdown loaders; no content hashing / idempotency |
-| **Chunking** | ⚠️ | One recursive splitter (1000 / 200); per-chunk char offsets captured | Single fixed strategy; no token-based or structure-aware chunking; `page`/`section` still pending loaders |
-| **Embedding** | ✅ | LiteLLM, `text-embedding-3-small`, 1536-d, batched, cost-logged | No embedding cache; dimension hardcoded to the model |
-| **Vector store** | ✅ | Postgres + pgvector, `Vector(1536)`, **HNSW index** (`vector_cosine_ops`) | Index params not yet tuned against eval metrics |
-| **Retrieval** | ⚠️ | Dense cosine top-k, user-scoped, **similarity scores returned** | Vector-only; no hybrid/keyword, no metadata filters |
+| **Document ingestion** | ✅ | `POST /documents/upload` (multipart) — PDF / DOCX / HTML / Markdown / text via a MIME→loader registry, emitting segments with page & section provenance | Synchronous with the request (holds a transaction across the whole embed); no normalization pass; no quality gate against scanned/empty PDFs |
+| **Idempotency** | ✅ | `(user_id, source)` identity, DB-enforced; `content_hash` + `chunker_version` + `embedding_model` gating; unchanged re-upload costs zero embedding calls; race-safe via savepoint | No cross-document dedup; no delete path, so the corpus only grows |
+| **Chunking** | ⚠️ | One recursive splitter (1000 / 200 chars), applied **per structural segment** so chunks never straddle a page or heading; `char_start` / `char_end` / `page` / `section` populated | Single fixed strategy, never compared; sized in characters while every downstream budget is in tokens; no re-chunk backfill |
+| **Embedding** | ⚠️ | LiteLLM, `text-embedding-3-small`, 1536-d, config-wired, batched, cost-logged | Model chosen by default, never benchmarked; `Vector(1536)` hardcoded against a swappable setting; unbounded batch size; no chunk-level cache |
+| **Vector store** | ✅ | Postgres + pgvector, **HNSW index** (`vector_cosine_ops`, `m=16`, `ef_construction=64`, set explicitly and documented in the migration) | Params untuned against eval metrics; `hnsw.ef_search` never set; the `owner_id` filter degrades ANN recall (see [D3](docs/rag-production-decisions.md)) |
+| **Retrieval** | ⚠️ | Dense cosine top-k, user-scoped, **similarity scores returned**; `retrieve()` split out from `query()` so it's measurable without an LLM | Vector-only — no hybrid/keyword, so exact-match queries have no working path; no metadata filters; no score threshold or abstention |
 | **Reranking** | ❌ | — | No second-stage reranker or rank fusion |
-| **Generation** | ✅ | Grounded prompt, citations, cost tracking, provider fallback | No streaming; no citation-span mapping |
-| **Evaluation** | ❌ | — | No dataset, no retrieval/generation metrics, no regression gate |
-| **API** | ⚠️ | Upload / query / list, JWT-auth | No delete, no streaming endpoint, no rate limiting |
-| **Deployment** | ⚠️ | `docker-compose` runs Postgres | No app Dockerfile, no CI/CD, no live deploy |
+| **Generation** | ✅ | Grounded prompt, per-source citations with scores, cost tracking, provider fallback, TTL answer cache that evals can bypass | No streaming; no claim-level citation mapping; prompt is unversioned and absent from the cache key |
+| **Evaluation** | ❌ | — | No dataset, no retrieval/generation metrics, no regression gate. **This is why five rows above are ⚠️ rather than ✅.** |
+| **API** | ⚠️ | Upload / query / list, JWT-auth | No delete, no streaming endpoint, no ingestion status, no rate limiting, unbounded `top_k` |
+| **Deployment** | ⚠️ | `docker-compose` runs Postgres | No app Dockerfile, no CI/CD, no live deploy, no real readiness probe |
 
 ---
 
@@ -196,14 +197,15 @@ docs/                # Technical report & roadmap
 
 ## 🧭 Roadmap
 
-Sequenced by production-signal-per-effort. The full file-level plan lives in **[docs/rag-production-roadmap.md](docs/rag-production-roadmap.md)**.
+Sequenced by *what unblocks the most other decisions*. Every remaining choice — with its options, trade-offs, and the measurement that would justify it — is enumerated in **[docs/rag-production-decisions.md](docs/rag-production-decisions.md)**. The original phase plan is preserved in [docs/rag-production-roadmap.md](docs/rag-production-roadmap.md).
 
-- **Phase 1 — Make retrieval production-correct** · HNSW index (`vector_cosine_ops`), return similarity scores, fix N+1 title lookups, add chunk metadata.
-- **Phase 2 — Ingestion & chunking strategy** · Multi-format file loaders (PDF/DOCX/HTML/MD), content hashing for idempotency, ≥2 pluggable chunkers, embedding cache.
-- **Phase 3 — Hybrid retrieval + reranking** · `tsvector` keyword search, Reciprocal Rank Fusion, cross-encoder / Cohere reranker (retrieve top-30 → rerank to top-5).
-- **Phase 4 — Evaluation pipeline** · Curated Q/A + gold-context dataset, retrieval metrics (recall@k, MRR, nDCG), generation metrics (faithfulness, relevance), `make eval` report.
-- **Phase 5 — Deployment & API hardening** · App Dockerfile, CI (ruff/mypy/pytest + eval regression gate), a real deploy target, streaming + delete + rate limiting.
-- **Phase 6 — Documentation & ADRs** · Architecture write-ups and Architecture Decision Records justifying each choice with eval numbers.
+- ✅ **Phase 1 — Make retrieval production-correct** · HNSW index (`vector_cosine_ops`), similarity scores returned, N+1 title lookups removed by denormalization, chunk provenance columns.
+- ✅ **Phase 2 — Ingestion** · Multi-format file loaders (PDF/DOCX/HTML/MD), content hashing for idempotent re-ingestion, transactional in-place replace. *(Pluggable chunkers and the embedding cache remain open.)*
+- 🔜 **Tier 0 — Correctness first** · Six defects that only surface under production conditions: filtered-ANN recall collapse under multi-tenancy, mixed embedding models ranking silently, hardcoded vector dimension, an unimplemented `filters` parameter, unbounded context, default JWT secret.
+- 🔜 **Tier 1 — Evaluation pipeline** · Golden Q/A + gold-context dataset stratified by query type, retrieval metrics (Recall@k, MRR, nDCG), generation metrics (faithfulness, relevance, correctness), CI regression gate. **Everything below is a guess until this exists.**
+- **Tier 2 — Hybrid retrieval + reranking** · `tsvector` keyword search, Reciprocal Rank Fusion, cross-encoder reranker (retrieve top-30 → rerank to top-5), abstention threshold — each adopted only if the numbers justify it.
+- **Tier 3 — Deployment & hardening** · Async ingestion with status, app Dockerfile, CI (ruff/mypy/pytest + eval gate), a real deploy target, streaming + delete + rate limiting, metrics and cost aggregation.
+- **Tier 4 — Deliberately deferred** · Query rewriting, feedback loops, hierarchical/Graph/agentic RAG — with the adoption trigger for each written down rather than silently skipped.
 
 ---
 
@@ -219,11 +221,12 @@ Sequenced by production-signal-per-effort. The full file-level plan lives in **[
 
 ## ⚠️ Known limitations
 
-These are tracked, not hidden — see the [roadmap](#-roadmap) and [technical report](docs/rag-production-roadmap.md):
+These are tracked, not hidden — each maps to a decision in the [decision report](docs/rag-production-decisions.md):
 
-- **Text-only ingestion** → real documents are files; loaders are Phase 2.
-- **Vector-only retrieval** → no keyword/hybrid recall, no reranking precision lift yet (Phase 3).
-- **No evaluation** → retrieval and answer quality are not yet measured; the eval harness is Phase 4.
+- **No evaluation** → retrieval and answer quality are not measured, which is why the chunk size, the embedding model, and the HNSW parameters are defaults rather than defended choices. This is the top priority, not the last phase. *(Part G)*
+- **Vector-only retrieval** → no keyword/hybrid channel, so exact-match queries (IDs, acronyms, proper nouns) have no working retrieval path; no reranking precision lift. *(E2, E5)*
+- **Filtered-ANN recall** → pgvector applies the `owner_id` filter *after* the HNSW graph walk, so a multi-tenant query can silently return fewer results than requested. Correctness bug, not a tuning knob. *(D3)*
+- **Synchronous ingestion** → a large PDF embeds inline in the request, holding a transaction open for its duration. *(A2)*
 - **Denormalized chunk titles** → each chunk stores a copy of its document title for fast retrieval, so a future document-rename endpoint must also update those copies.
 
 ---
@@ -232,6 +235,6 @@ These are tracked, not hidden — see the [roadmap](#-roadmap) and [technical re
 
 Built as a portfolio piece to demonstrate **production RAG engineering** — layering, async, cost-awareness, and an honest path from MVP to production.
 
-📄 **[Read the full technical report →](docs/rag-production-roadmap.md)**
+📄 **[Read the decision report →](docs/rag-production-decisions.md)** · [Original roadmap](docs/rag-production-roadmap.md)
 
 </div>

@@ -15,6 +15,7 @@ def _mock_embedding_service() -> EmbeddingService:
     mock = AsyncMock(spec=EmbeddingService)
     mock.embed_text.side_effect = lambda text: [0.1] * 1536
     mock.embed_batch.side_effect = lambda texts: [[0.1] * 1536 for _ in texts]
+    mock.model = "text-embedding-3-small"  # part of the idempotency key
     return mock
 
 
@@ -49,10 +50,14 @@ async def test_upload_document_returns_201(pg_async_client: AsyncClient) -> None
     token = login.json()["access_token"]
 
     response = await pg_async_client.post(
-        "/documents",
-        json={
-            "title": "Test Document",
-            "content": "This is a test document with enough content to be chunked. " * 50,
+        "/documents/upload",
+        data={"title": "Test Document"},
+        files={
+            "file": (
+                "test.txt",
+                b"This is a test document with enough content to be chunked. " * 50,
+                "text/plain",
+            )
         },
         headers={"Authorization": f"Bearer {token}"},
     )
@@ -84,10 +89,14 @@ async def test_query_returns_answer_with_sources(pg_async_client: AsyncClient) -
 
     # Upload document first
     await pg_async_client.post(
-        "/documents",
-        json={
-            "title": "Knowledge Base",
-            "content": "Python is a programming language. " * 100,
+        "/documents/upload",
+        data={"title": "Knowledge Base"},
+        files={
+            "file": (
+                "kb.txt",
+                b"Python is a programming language. " * 100,
+                "text/plain",
+            )
         },
         headers={"Authorization": f"Bearer {token}"},
     )
@@ -127,7 +136,7 @@ async def test_query_requires_auth(pg_async_client: AsyncClient) -> None:
 
 async def test_upload_requires_auth(pg_async_client: AsyncClient) -> None:
     response = await pg_async_client.post(
-        "/documents",
-        json={"title": "Test", "content": "test content here with enough length for validation"},
+        "/documents/upload",
+        files={"file": ("notes.txt", b"test content here with enough length", "text/plain")},
     )
     assert response.status_code == 401
