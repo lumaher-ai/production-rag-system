@@ -1,12 +1,8 @@
 from datetime import datetime
+from typing import Any
 from uuid import UUID
 
 from pydantic import BaseModel, Field
-
-
-class DocumentUploadRequest(BaseModel):
-    title: str = Field(..., min_length=1, max_length=255)
-    content: str = Field(..., min_length=10, max_length=500_000)
 
 
 class DocumentResponse(BaseModel):
@@ -21,6 +17,11 @@ class DocumentResponse(BaseModel):
 class QueryRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=2000)
     top_k: int = Field(default=5, ge=1, le=20)
+    filters: dict[str, Any] | None = Field(
+        default=None,
+        description="Metadata/context filter. Part of the cache key; retrieval "
+        "filtering on it is not applied yet (reserved for forward-compat).",
+    )
 
 
 class ChunkSource(BaseModel):
@@ -41,3 +42,8 @@ class QueryResponse(BaseModel):
     input_tokens: int
     output_tokens: int
     cost_usd: float
+    cached: bool = Field(
+        default=False,
+        description="True when served from the deterministic query cache "
+        "(no embedding, retrieval, or LLM call was made).",
+    )

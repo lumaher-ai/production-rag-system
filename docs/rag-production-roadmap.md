@@ -6,6 +6,20 @@
 **Purpose:** Gap analysis and implementation plan to turn the current RAG MVP into a
 production-grade, portfolio-ready system suitable for a Senior AI Engineer application.
 
+> ### ⚠️ Status as of 2026-08-07 — partially superseded
+>
+> **Phases 1 and 2 have shipped.** The current-state inventory (§2) and gap analysis (§3)
+> below describe the repository as it stood on 2026-07-15 and are **no longer accurate**:
+> the HNSW index, similarity scores, N+1 fix, chunk provenance columns, file loaders, and
+> idempotent ingestion all exist now. Completed items are marked ✅ inline.
+>
+> **For the current gap analysis, read [`rag-production-decisions.md`](rag-production-decisions.md)** —
+> it re-frames the remaining work as ~49 explicit engineering decisions (embedding model,
+> vector store, index selection, fusion strategy, eval thresholds, …), verified against
+> the source rather than against this document.
+>
+> This file is kept as a dated record of the original plan, so the before/after is legible.
+
 ---
 
 ## 1. Executive Summary
@@ -32,21 +46,25 @@ prioritized, file-level implementation plan.
 
 ## 2. Current-State Inventory
 
-| Component | File | Status |
-|---|---|---|
-| Chunking | `services/document_service.py` (`RecursiveCharacterTextSplitter`, 1000/200) | ✅ Works, single strategy |
-| Embedding | `llm/embedding_service.py` (LiteLLM, `text-embedding-3-small`, 1536-d, batched) | ✅ Solid |
-| Vector store | `models/document.py` (`Vector(1536)`), pgvector | ⚠️ No index |
-| Retrieval | `repositories/document_repository.py::search_similar_chunks` (cosine top-k) | ⚠️ Vector-only |
-| Generation | `services/document_service.py::query` (grounded prompt, sources, cost) | ✅ Solid |
-| Agent tools | `agent/tools.py` (`search_documents`, `list_documents`, `get_document_content`) | ✅ Works |
-| API | `routes/documents.py` (upload / query / list, JWT-auth) | ⚠️ Partial |
-| Ingestion input | `schemas/document.py` (raw `content` string only) | ❌ No file upload |
-| Reranking | — | ❌ Missing |
-| Evaluation | — | ❌ Missing |
-| Deployment | `docker-compose.yml` (Postgres only) | ❌ No app image |
-| CI/CD | `.github/` | ❌ Empty |
-| Docs | `README.md` (2 lines) | ❌ Missing |
+> **Stale as of 2026-08-07.** The "Status" column reflects 2026-07-15. A "Now" column has been
+> added showing verified current state; see `rag-production-decisions.md` §0 for the full
+> claim-by-claim correction.
+
+| Component | File | Status (2026-07-15) | Now (2026-08-07) |
+|---|---|---|---|
+| Chunking | `services/document_service.py` (`RecursiveCharacterTextSplitter`, 1000/200) | ✅ Works, single strategy | ⚠️ Still one strategy, now applied per structural segment |
+| Embedding | `llm/embedding_service.py` (LiteLLM, `text-embedding-3-small`, 1536-d, batched) | ✅ Solid | ⚠️ Config-wired, but unbounded batch size; no chunk-level cache |
+| Vector store | `models/document.py` (`Vector(1536)`), pgvector | ⚠️ No index | ✅ **HNSW index shipped** (`1188038e4c5b`) |
+| Retrieval | `repositories/document_repository.py::search_similar_chunks` (cosine top-k) | ⚠️ Vector-only | ⚠️ Vector-only, **scores now returned**; filtered-ANN recall bug open |
+| Generation | `services/document_service.py::query` (grounded prompt, sources, cost) | ✅ Solid | ✅ Unchanged; `retrieve()` split out for eval |
+| Agent tools | `agent/tools.py` (`search_documents`, `list_documents`, `get_document_content`) | ✅ Works | ✅ N+1 resolved via denormalization |
+| API | `routes/documents.py` (upload / query / list, JWT-auth) | ⚠️ Partial | ⚠️ `+ /documents/upload`; still no delete/stream/status |
+| Ingestion input | `schemas/document.py` (raw `content` string only) | ❌ No file upload | ✅ **`ingestion/loaders.py`** — PDF/DOCX/HTML/MD via MIME registry |
+| Reranking | — | ❌ Missing | ❌ Still missing |
+| Evaluation | — | ❌ Missing | ❌ Still missing — now the top priority |
+| Deployment | `docker-compose.yml` (Postgres only) | ❌ No app image | ❌ Unchanged |
+| CI/CD | `.github/` | ❌ Empty | ❌ Unchanged |
+| Docs | `README.md` (2 lines) | ❌ Missing | ✅ Portfolio README written |
 
 ---
 
@@ -132,17 +150,28 @@ decisions."*
 
 ## 4. Notable Code-Level Issues to Fix Along the Way
 
-1. **N+1 queries in `DocumentService.query`** (`document_service.py:80` and `:95`): the
-   parent `Document` is fetched inside two separate loops over chunks. Denormalize
-   `document_title` onto `DocumentChunk`, or batch-load titles by id. `agent/tools.py::search_documents`
-   has the same pattern.
-2. **No vector index** — see 3.4. Highest priority.
-3. **Embedding dim hardcoded** (`Vector(1536)`) couples the schema to one model; make it a
-   config-driven constant referenced by both model and migration.
-4. **Retrieval leaks no score** — `search_similar_chunks` discards the distance, so
-   `similarity_rank` is positional only and can't be thresholded. Return the score.
-5. **README over-claims** ("deployed on AWS", "custom MCP server") relative to what's in
-   the repo — reconcile before it goes in a portfolio.
+1. ✅ **DONE — N+1 queries in `DocumentService.query`**: fixed by denormalizing
+   `document_title` and `owner_id` onto `DocumentChunk` (`757e706cd39a`).
+2. ✅ **DONE — No vector index**: HNSW with `vector_cosine_ops` shipped in `1188038e4c5b`.
+3. ⬜ **OPEN — Embedding dim hardcoded** (`Vector(1536)`) couples the schema to one model.
+   `settings.embedding_model` is now swappable but the column is not, so the two can silently
+   disagree. See decisions doc **C2**.
+4. ✅ **DONE — Retrieval leaks no score**: `search_similar_chunks` returns
+   `(chunk, 1 - cosine_distance)`, surfaced as `ChunkSource.similarity_score`.
+5. ✅ **DONE — README over-claims**: rewritten. (It now *under*-claims instead — corrected
+   2026-08-07.)
+
+**Defects found since, not in the original list** (full detail in the decisions doc, Tier 0):
+
+6. **Filtered-ANN under-return** — pgvector post-filters the HNSW scan, so `WHERE owner_id`
+   can return fewer than `top_k` rows with no error. Multi-tenant recall degrades silently.
+   Decisions doc **D3** — the highest-priority correctness bug in the repo.
+7. **Mixed embedding models rank silently** — no query-time guard that stored vectors were
+   computed under the current model, and no backfill path. **C5**.
+8. **Dead `filters` parameter** — accepted by `retrieve()`/`query()` and folded into the
+   answer-cache key, but never applied to the query. **E4**.
+9. **Unbounded `top_k` and context budget**; **default JWT secret boots in production**.
+   **E8**, **H8**.
 
 ---
 
@@ -150,24 +179,33 @@ decisions."*
 
 Ordered by production-signal-per-effort. Each item lists the concrete files to add/change.
 
-### Phase 1 — Make retrieval production-correct (highest signal)
-- **Add HNSW index** — new Alembic migration:
-  `CREATE INDEX ... USING hnsw (embedding vector_cosine_ops)`. *(fixes 3.4)*
-- **Return similarity scores** from `search_similar_chunks`; expose in `ChunkSource`.
-  *(repository + schema)*
-- **Fix N+1** — denormalize `document_title` onto `DocumentChunk` (migration + model +
-  ingestion), simplify `query()` and `search_documents`.
-- **Chunk metadata** — add `page`/`section`/`char_start`/`char_end` columns for future
-  citation mapping.
+### Phase 1 — Make retrieval production-correct (highest signal) — ✅ COMPLETE
+- ✅ **Add HNSW index** — `1188038e4c5b`, `vector_cosine_ops`, `m=16`, `ef_construction=64`
+  set explicitly and documented. *(fixed 3.4)*
+- ✅ **Return similarity scores** — `search_similar_chunks` returns `(chunk, similarity)`;
+  exposed as `ChunkSource.similarity_score`.
+- ✅ **Fix N+1** — `document_title` + `owner_id` denormalized onto `DocumentChunk`
+  (`757e706cd39a`); `query()` and `search_documents` simplified.
+- ✅ **Chunk metadata** — `page` / `section` / `char_start` / `char_end` added
+  (`b5c1f0ed6025`) and populated per structural segment.
 
-### Phase 2 — Ingestion & chunking strategy
-- **File loaders** — new `ingestion/loaders.py` (PDF via `pypdf`, DOCX, HTML via existing
-  `beautifulsoup4`/`markdownify`, plain/Markdown). New `POST /documents/upload`
-  (`multipart`, `UploadFile`) alongside the JSON route.
-- **Content hashing** for idempotent ingestion (skip re-embedding unchanged content).
-- **Pluggable chunkers** — `ingestion/chunking.py` with ≥2 strategies (recursive vs
-  token-based vs structure-aware); make strategy a config choice.
-- **Embedding cache** keyed by content hash.
+> **Follow-up now open:** the index exists but its params are untuned, `hnsw.ef_search` is
+> never set, and the `owner_id` filter degrades ANN recall. See decisions doc **D2**/**D3**.
+
+### Phase 2 — Ingestion & chunking strategy — ⚠️ MOSTLY COMPLETE
+- ✅ **File loaders** — `ingestion/loaders.py` with a MIME→loader registry (PDF via `pypdf`,
+  DOCX, HTML via `markdownify`, plain/Markdown), emitting `ExtractedSegment` with page/section
+  provenance. `POST /documents/upload` (multipart) ships alongside the JSON route.
+- ✅ **Content hashing** — `(user_id, source)` identity + `content_hash` + `chunker_version` +
+  `embedding_model` gating; unchanged sources cost zero embedding calls, edited sources are
+  replaced in place, concurrent uploads collapse via savepoint.
+- ⬜ **Pluggable chunkers** — still one strategy. Decisions doc **B1**/**B2**.
+- ⬜ **Embedding cache** — document-level idempotency exists; no chunk-level cache.
+  Decisions doc **C4**, which also flags an unbounded `embed_batch` size as the more urgent
+  half of that item.
+- ⬜ **Not in the original plan, now known to matter:** ingestion is synchronous and holds a
+  transaction across the whole embed (**A2**); there is no normalization pass (**A3**) and no
+  quality gate against silently-empty scanned PDFs (**A6**).
 
 ### Phase 3 — Hybrid retrieval + reranking
 - **Keyword search** — Postgres `tsvector` column + GIN index on chunk content.
@@ -254,6 +292,18 @@ What reviewers will look for, and where this plan delivers it:
    *engineered, measured* system.
 2. Phase 3 (rerank) — biggest quality lift you can then *prove* with the eval numbers.
 3. Phases 2, 5, 6 to round out ingestion, deployment, and presentation.
+
+> **Updated sequencing (2026-08-07).** Phases 1–2 are done, and the recommendation above still
+> holds for what remains — with one addition ahead of it. The verified sequence is now:
+>
+> **Tier 0 — six correctness bugs already live in the code** (D3 filtered-ANN recall, C5 mixed
+> embedding models, C2 hardcoded dim, E4 dead filter param, E8 unbounded context, H8 default
+> JWT secret). None need a new subsystem; all are latent production incidents.
+> **Tier 1 — Phase 4 (eval).** Every recommendation in Phases 2–3 is a guess until this exists.
+> **Tier 2 — Phase 3** (hybrid + RRF + reranker), now measurable.
+> **Tier 3 — Phase 5** plus async ingestion, metrics, and cost controls.
+>
+> Full reasoning and per-decision detail: [`rag-production-decisions.md`](rag-production-decisions.md).
 
 ---
 

@@ -6,6 +6,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from production_rag.config import get_settings
 from production_rag.database import get_session
 from production_rag.exceptions import ForbiddenError
 from production_rag.llm.client import LLMClient
@@ -13,6 +14,7 @@ from production_rag.llm.embedding_service import EmbeddingService
 from production_rag.models import User
 from production_rag.models.enums import UserRole
 from production_rag.repositories.document_repository import DocumentRepository
+from production_rag.repositories.query_cache_repository import QueryCacheRepository
 from production_rag.repositories.refresh_token_repository import RefreshTokenRepository
 from production_rag.repositories.user_repository import UserRepository
 from production_rag.services.auth_service import AuthService, InvalidTokenError, decode_access_token
@@ -107,7 +109,9 @@ _embedding_service: EmbeddingService | None = None
 def get_embedding_service() -> EmbeddingService:
     global _embedding_service
     if _embedding_service is None:
-        _embedding_service = EmbeddingService()
+        # Model comes from config so it is the single source of truth shared by
+        # ingestion, the idempotency key, and the persisted document row.
+        _embedding_service = EmbeddingService(model=get_settings().embedding_model)
     return _embedding_service
 
 
@@ -115,6 +119,12 @@ def get_document_repository(
     session: AsyncSession = Depends(get_db_session),
 ) -> DocumentRepository:
     return DocumentRepository(session)
+
+
+def get_query_cache_repository(
+    session: AsyncSession = Depends(get_db_session),
+) -> QueryCacheRepository:
+    return QueryCacheRepository(session)
 
 
 def get_checkpointer(request: Request) -> BaseCheckpointSaver | None:
@@ -125,9 +135,12 @@ def get_document_service(
     repository: DocumentRepository = Depends(get_document_repository),
     embedding_service: EmbeddingService = Depends(get_embedding_service),
     llm_client: LLMClient = Depends(get_llm_client),
+    query_cache_repository: QueryCacheRepository = Depends(get_query_cache_repository),
 ) -> DocumentService:
     return DocumentService(
         repository=repository,
         embedding_service=embedding_service,
         llm_client=llm_client,
+        query_cache_repository=query_cache_repository,
+        query_cache_ttl_seconds=get_settings().query_cache_ttl_seconds,
     )

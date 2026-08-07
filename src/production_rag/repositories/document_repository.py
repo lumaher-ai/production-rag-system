@@ -1,10 +1,14 @@
+from typing import TYPE_CHECKING
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from production_rag.exceptions import NotFoundError
 from production_rag.models.document import Document, DocumentChunk
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSessionTransaction
 
 
 class DocumentNotFoundError(NotFoundError):
@@ -15,26 +19,89 @@ class DocumentRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
+    def savepoint(self) -> "AsyncSessionTransaction":
+        """A nested transaction (SAVEPOINT) so a unique-violation on one write can
+        be caught and recovered from without poisoning the outer transaction."""
+        return self._session.begin_nested()
+
     async def create_document(
         self,
         title: str,
         content: str,
         user_id: UUID,
         chunk_count: int,
+        content_hash: str,
+        chunker_version: str,
+        embedding_model: str,
+        source: str,
     ) -> Document:
         document = Document(
             title=title,
             content=content,
             user_id=user_id,
             chunk_count=chunk_count,
+            content_hash=content_hash,
+            chunker_version=chunker_version,
+            embedding_model=embedding_model,
+            source=source,
         )
         self._session.add(document)
         await self._session.flush()
         return document
 
+    async def find_document_by_source(
+        self,
+        user_id: UUID,
+        source: str,
+    ) -> Document | None:
+        """Return this user's existing document for ``source``, if any.
+
+        The identity mirrors the ``uq_documents_user_source`` constraint: at most
+        one row per (owner, source). Used to decide create vs. replace on upload.
+        """
+        result = await self._session.execute(
+            select(Document).where(
+                Document.user_id == user_id,
+                Document.source == source,
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def update_document_content(
+        self,
+        document: Document,
+        title: str,
+        content: str,
+        chunk_count: int,
+        content_hash: str,
+        chunker_version: str,
+        embedding_model: str,
+    ) -> Document:
+        """Rewrite an existing document's body/metadata in place (source is kept).
+
+        Callers replace the document's chunks separately via
+        ``delete_chunks_by_document_id`` + ``create_chunk``.
+        """
+        document.title = title
+        document.content = content
+        document.chunk_count = chunk_count
+        document.content_hash = content_hash
+        document.chunker_version = chunker_version
+        document.embedding_model = embedding_model
+        await self._session.flush()
+        return document
+
+    async def delete_chunks_by_document_id(self, document_id: UUID) -> None:
+        """Delete all chunks belonging to a document (used before re-chunking)."""
+        await self._session.execute(
+            delete(DocumentChunk).where(DocumentChunk.document_id == document_id)
+        )
+        await self._session.flush()
+
     async def create_chunk(
         self,
         document_id: UUID,
+        owner_id: UUID,
         document_title: str,
         chunk_index: int,
         content: str,
@@ -47,6 +114,7 @@ class DocumentRepository:
     ) -> DocumentChunk:
         chunk = DocumentChunk(
             document_id=document_id,
+            owner_id=owner_id,
             document_title=document_title,
             chunk_index=chunk_index,
             content=content,
@@ -84,9 +152,10 @@ class DocumentRepository:
         """
         distance = DocumentChunk.embedding.cosine_distance(query_embedding)
         result = await self._session.execute(
+            # Owner scope comes from the denormalized owner_id — no join to
+            # documents needed (title is already carried on the chunk too).
             select(DocumentChunk, distance.label("distance"))
-            .join(Document, DocumentChunk.document_id == Document.id)
-            .where(Document.user_id == user_id)
+            .where(DocumentChunk.owner_id == user_id)
             .order_by(distance)
             .limit(top_k)
         )
