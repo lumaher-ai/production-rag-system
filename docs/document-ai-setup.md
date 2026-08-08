@@ -78,14 +78,34 @@ why the two live in different modules even when they read the same key file.
 
 ## 5. Create the batch bucket (large documents only)
 
-Needed only for documents past `DOCUMENTAI_BATCH_THRESHOLD_PAGES` (default 60). Below
-that, documents are sharded and sent inline and no bucket is touched.
+**Skippable.** The bucket is touched only by documents past
+`DOCUMENTAI_BATCH_THRESHOLD_PAGES` (default 60); below that, PDFs are sharded and sent
+inline and no bucket is involved. Leaving `DOCUMENTAI_GCS_BUCKET` empty is a valid
+state — a large document then fails with "set DOCUMENTAI_GCS_BUCKET" rather than
+something cryptic.
+
+**Pick a name first.** Bucket names live in one namespace shared by every Google Cloud
+customer, so there is no default and nothing scopes them to your project — `gs://BUCKET`
+below is a placeholder and will be rejected. Prefixing with the project id is the
+convention that reliably survives that, since project ids are already globally unique.
+Names must be 3–63 characters, lowercase letters/numbers/dashes, starting and ending
+alphanumeric, and may not contain `google` or start with `goog`.
 
 ```bash
-gcloud storage buckets create gs://BUCKET --location=US --uniform-bucket-level-access
-gcloud storage buckets add-iam-policy-binding gs://BUCKET \
+BUCKET=PROJECT_ID-docai      # e.g. paddington-production-rag-docai
+
+gcloud storage buckets create gs://$BUCKET --location=US --uniform-bucket-level-access
+gcloud storage buckets add-iam-policy-binding gs://$BUCKET \
   --member="serviceAccount:SA_EMAIL" --role="roles/storage.objectAdmin"
 ```
+
+`--location` must match the processor's region from step 3: `US` for a `us` processor,
+`EU` for an `eu` one. A bucket in the wrong place still works but pays cross-region
+egress on every large document.
+
+`--member` takes the `serviceAccount:` prefix exactly once, followed by the account's
+email — `serviceAccount:name@project.iam.gserviceaccount.com`. Doubling the prefix is a
+400, not a helpful error.
 
 The worker deletes its staging objects in a `finally`, so the bucket should stay empty.
 Add a 1-day lifecycle rule anyway — it is the backstop for the case where the process
@@ -93,7 +113,7 @@ dies between upload and cleanup:
 
 ```bash
 echo '{"rule":[{"action":{"type":"Delete"},"condition":{"age":1}}]}' > /tmp/lifecycle.json
-gcloud storage buckets update gs://BUCKET --lifecycle-file=/tmp/lifecycle.json
+gcloud storage buckets update gs://$BUCKET --lifecycle-file=/tmp/lifecycle.json
 ```
 
 ## 6. Smoke-test before touching the application
@@ -130,7 +150,7 @@ DOCUMENTAI_LOCATION=us
 DOCUMENTAI_PROCESSOR_ID=<hex id from step 3>
 DOCUMENTAI_PROCESSOR_VERSION=pretrained-layout-parser-v1.0-2024-06-03
 DOCUMENTAI_SERVICE_ACCOUNT_FILE=secrets/your-key.json   # or leave empty to reuse the Drive key
-DOCUMENTAI_GCS_BUCKET=BUCKET                            # only if step 5 was done
+DOCUMENTAI_GCS_BUCKET=<the bucket from step 5>          # leave empty to skip batch
 ```
 
 **On pinning the version.** `DOCUMENTAI_PROCESSOR_VERSION` names an exact model, not
@@ -174,7 +194,7 @@ direct-to-Document-AI path rather than the fallback.
 For a document past the batch threshold, confirm the bucket is empty afterwards:
 
 ```bash
-gcloud storage ls -r gs://BUCKET/docai/    # should list nothing
+gcloud storage ls -r gs://$BUCKET/docai/   # should list nothing
 ```
 
 ---
