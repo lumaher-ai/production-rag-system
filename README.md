@@ -91,9 +91,10 @@ Honest inventory, verified against the source. ✅ = implemented and running · 
 
 | Stage | Status | What's there now | The production gap |
 |---|:---:|---|---|
-| **Document ingestion** | ✅ | `POST /documents/upload` (multipart) and `POST /documents/ingest` (`https://`, `gdrive://`) — PDF / DOCX / HTML / Markdown / text via a MIME→loader registry, emitting segments with page & section provenance | No quality gate against scanned/empty PDFs |
+| **Document ingestion** | ✅ | `POST /documents/upload` (multipart) and `POST /documents/ingest` (`https://`, `gdrive://`) — PDF / DOCX / HTML / Markdown / text via a MIME→loader registry, emitting segments with page & section provenance. A **quality gate** rejects PDFs below 50 chars/page (dividing by the PDF's real page count, not the pages that parsed) with the measurements that justify it | Threshold is one number, unvalidated against a real corpus; no boilerplate detection |
+| **OCR / Office formats** | ✅ | **Document AI Layout Parser** as a *fallback* extractor — reached only when the gate fails or no local parser exists, so a readable document costs nothing. Adds `.xlsx` / `.xlsm` / `.pptx`, which have no local parser at all. PDFs sharded to the 15-page online limit with page offsets restored; batch via Cloud Storage past 60 pages; extraction cached on the job row so a retry never re-buys it. [Setup runbook](docs/document-ai-setup.md) | Batch path unproven against a real 500-page scan; its own chunker deliberately unused; no measurement of whether OCR'd text retrieves worse than parsed text |
 | **Normalization** | ✅ | Unicode NFKC + whitespace, applied to documents **and** queries under identical rules. `NORMALIZER_VERSION` sits in the idempotency gate beside `chunker_version` and `embedding_model`, so a rules change can never serve vectors computed under the old ones. `reindex` CLI re-processes stale documents | Mechanical only — no boilerplate or header/footer detection; NFKC is lossy for math notation |
-| **Async ingestion** | ✅ | Redis + **arq** worker, `ingestion_jobs` table, `202 + job_id`, `GET /documents/jobs/{id}`. Embeds in batches of 100, checkpointing each — a killed worker resumes from its cursor instead of re-embedding. Orphaned jobs reclaimed by a heartbeat sweeper | Failed jobs retain their payload with no retention policy; no dead-letter surface; polling rather than SSE |
+| **Async ingestion** | ✅ | Redis + **arq** worker, `ingestion_jobs` table, `202 + job_id`, `GET /documents/jobs/{id}`. Embeds in batches of 100, checkpointing each — a killed worker resumes from its cursor instead of re-embedding. Orphaned jobs reclaimed by a heartbeat sweeper. Failures land in an append-only **`failed_ingestions`** dead-letter table with a countable `reason`, and non-retryable ones (a scan is still a scan on attempt three) stop retrying instead of burning the budget. `GET /documents/failures`, `POST /documents/failures/{id}/retry` | Failed jobs retain their payload with no retention policy; polling rather than SSE; no job cancellation |
 | **Idempotency** | ✅ | `(user_id, source)` identity, DB-enforced; `content_hash` + `chunker_version` + `embedding_model` gating; unchanged re-upload costs zero embedding calls; race-safe via savepoint | No cross-document dedup; no delete path, so the corpus only grows |
 | **Chunking** | ⚠️ | One recursive splitter (1000 / 200 chars), applied **per structural segment** on normalized text so chunks never straddle a page or heading; `char_start` / `char_end` / `page` / `section` populated | Single fixed strategy, never compared; sized in characters while every downstream budget is in tokens; no re-chunk backfill |
 | **Embedding** | ⚠️ | LiteLLM, `text-embedding-3-small`, 1536-d, config-wired, batched in bounded groups of 100, cost-logged | Model chosen by default, never benchmarked; `Vector(1536)` hardcoded against a swappable setting; no chunk-level cache |
@@ -103,7 +104,7 @@ Honest inventory, verified against the source. ✅ = implemented and running · 
 | **Reranking** | ❌ | — | No second-stage reranker or rank fusion |
 | **Generation** | ✅ | Grounded prompt, per-source citations with scores, cost tracking, provider fallback, TTL answer cache that evals can bypass | No streaming; no claim-level citation mapping; prompt is unversioned and absent from the cache key |
 | **Evaluation** | ❌ | — | No dataset, no retrieval/generation metrics, no regression gate. **This is why five rows above are ⚠️ rather than ✅.** |
-| **API** | ⚠️ | Upload / ingest-by-URI / query / list / job status, JWT-auth | No delete, no streaming endpoint, no rate limiting, unbounded `top_k` |
+| **API** | ⚠️ | Upload / ingest-by-URI / query / list / job status / failure list + retry, JWT-auth | No delete, no streaming endpoint, no rate limiting, unbounded `top_k` |
 | **Deployment** | ⚠️ | `docker-compose` runs Postgres + Redis | No app or worker Dockerfile, no CI/CD, no live deploy, no real readiness probe |
 
 ---
@@ -206,6 +207,11 @@ uv run uvicorn production_rag.main:app --reload
 ```
 
 The API is now live at **http://127.0.0.1:8000** — interactive docs at **/docs**.
+
+**Optional — OCR.** Scanned PDFs are rejected by the quality gate and `.xlsx`/`.pptx` return 415
+until Google Document AI is configured. That is a project, a region, a created processor, an IAM
+role and a regional endpoint, not an API key — the [setup runbook](docs/document-ai-setup.md)
+walks through it in the order that makes each failure obvious.
 
 ```bash
 # Run the test suite

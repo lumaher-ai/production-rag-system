@@ -63,6 +63,26 @@ def _ocr_on(**overrides):
     )
 
 
+def _ocr_off(**overrides):
+    """Settings with OCR explicitly disabled.
+
+    Every field is stated rather than inherited from ``get_settings()``: a
+    developer whose ``.env`` has real Document AI credentials would otherwise
+    run these tests against a different code path than CI does, and the test
+    that breaks is the one asserting OCR was *not* used — the one that matters.
+    """
+    return get_settings().model_copy(
+        update={
+            "ocr_enabled": False,
+            "documentai_project_id": "",
+            "documentai_processor_id": "",
+            "documentai_service_account_file": "",
+            "google_service_account_file": "",
+            **overrides,
+        }
+    )
+
+
 def _dense(pages: int) -> list[ExtractedSegment]:
     return [
         ExtractedSegment(text="Recovered prose. " * 40, page=i + 1) for i in range(pages)
@@ -112,7 +132,7 @@ async def test_a_scanned_pdf_escalates_and_the_ocr_result_wins() -> None:
 async def test_a_scan_with_ocr_off_is_rejected_with_a_pointer_to_the_fix() -> None:
     with pytest.raises(LowTextYieldError) as excinfo:
         await extract_segments(
-            make_scanned_pdf(20, text_pages=1), "scan.pdf", PDF_MIME, get_settings()
+            make_scanned_pdf(20, text_pages=1), "scan.pdf", PDF_MIME, _ocr_off()
         )
 
     assert "OCR is disabled" in excinfo.value.detail
@@ -121,7 +141,7 @@ async def test_a_scan_with_ocr_off_is_rejected_with_a_pointer_to_the_fix() -> No
 
 async def test_ocr_enabled_but_unconfigured_says_so_specifically() -> None:
     """"Enabled" and "addressed" are different problems with different fixes."""
-    settings = get_settings().model_copy(update={"ocr_enabled": True})
+    settings = _ocr_off(ocr_enabled=True)
 
     with pytest.raises(LowTextYieldError) as excinfo:
         await extract_segments(
@@ -182,7 +202,7 @@ async def test_a_presentation_goes_directly_to_ocr() -> None:
 
 async def test_a_spreadsheet_without_ocr_is_an_unsupported_type() -> None:
     with pytest.raises(UnsupportedFileTypeError) as excinfo:
-        await extract_segments(b"PK\x03\x04", "book.xlsx", XLSX_MIME, get_settings())
+        await extract_segments(b"PK\x03\x04", "book.xlsx", XLSX_MIME, _ocr_off())
 
     assert "XLSX" in excinfo.value.detail
     assert "OCR_ENABLED=true" in excinfo.value.detail
@@ -213,13 +233,26 @@ async def test_uploading_a_spreadsheet_is_415_when_ocr_is_unconfigured(
     pg_async_client: AsyncClient, job_queue
 ) -> None:
     """Better than a 202 followed by a job that fails a second later."""
-    token = await _auth_token(pg_async_client, "xlsx-off@example.com")
+    from production_rag.config import get_settings as _get_settings
+    from production_rag.main import app
 
-    response = await pg_async_client.post(
-        "/documents/upload",
-        files={"file": ("book.xlsx", b"PK\x03\x04", XLSX_MIME)},
-        headers={"Authorization": f"Bearer {token}"},
-    )
+    # Overridden rather than inherited: the endpoint's answer depends on
+    # deployment state by design, so the test has to state which deployment it
+    # is describing instead of borrowing the developer's .env.
+    # A lambda, not `_ocr_off` itself: FastAPI reads an override's signature as
+    # dependencies, and `**overrides` would become request parameters.
+    settings = _ocr_off()
+    app.dependency_overrides[_get_settings] = lambda: settings
+    try:
+        token = await _auth_token(pg_async_client, "xlsx-off@example.com")
+
+        response = await pg_async_client.post(
+            "/documents/upload",
+            files={"file": ("book.xlsx", b"PK\x03\x04", XLSX_MIME)},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    finally:
+        app.dependency_overrides.pop(_get_settings, None)
 
     assert response.status_code == 415
     assert "OCR_ENABLED=true" in response.json()["detail"]

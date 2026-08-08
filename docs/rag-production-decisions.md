@@ -50,6 +50,12 @@ query is a sequential scan), no file loaders." That was false and understated th
 that under-claims is as much an accuracy defect as one that over-claims. Both have been reconciled
 against verified state, and the roadmap now carries a banner pointing here.
 
+**Also corrected 2026-08-08:** the supported-format list above is now PDF / DOCX / HTML / Markdown
+/ text **plus XLSX / XLSM / PPTX**, the last three reachable only where Document AI is configured
+(**A6**). "Supported" is therefore a property of a deployment rather than of the codebase, which
+is why `POST /documents/upload` answers 415 or 202 for the same spreadsheet depending on whether
+credentials are present.
+
 So the honest gap is narrower and sharper than the roadmap implies. **Phases 1 and 2 are done.**
 What remains is: retrieval quality (Part E), the measurement layer that would justify any of it
 (Part G), and the operational envelope (Part H).
@@ -157,9 +163,9 @@ What remains is: retrieval quality (Part E), the measurement layer that would ju
   cleared. 19 tests cover the lifecycle, resume, chunker-change restart, orphan detection, and
   owner isolation.
 - **Follow-ups this opened:** failed jobs retain their payload (so a retry needs no re-upload) and
-  therefore need a retention policy; a dead-letter surface once jobs accumulate; job cancellation;
-  progress via SSE instead of polling; and the A1 folder case — `gdrive://<folder_id>` fanning out
-  to one job per file is natural now that a queue exists.
+  therefore need a retention policy; ~~a dead-letter surface once jobs accumulate~~ **— shipped,
+  see A6**; job cancellation; progress via SSE instead of polling; and the A1 folder case —
+  `gdrive://<folder_id>` fanning out to one job per file is natural now that a queue exists.
 
 ### A3. What normalization is applied before embedding?
 
@@ -283,18 +289,79 @@ reasons the hash cannot cover:
 
 ### A6. What happens when a document fails to ingest?
 
-- **State:** ❌
-- **Now:** The exception propagates, the transaction rolls back, the user gets an HTTP error. Nothing
-  is recorded. A scanned PDF that yields zero extractable text ingests "successfully" as an empty
-  or near-empty document — a **silent** corpus hole.
-- **Options:** (a) status quo; (b) quality gates at ingest (min extracted chars/page, non-empty
-  segment count, detected-language check) that reject loudly; (c) + a dead-letter table and
-  operator surface; (d) + OCR fallback for image-only PDFs.
-- **Call:** **(b) immediately** — reject a PDF yielding < ~50 chars/page with a clear
-  "this looks scanned; OCR is not supported" error. Silent partial ingestion is worse than a
-  rejected upload because it corrupts recall invisibly. (c) follows naturally once A2 lands.
-- **Proof:** Ingestion failure rate by cause; count of documents with anomalously low
-  chars-per-page; empty-retrieval rate (H5) as the downstream symptom.
+- **State:** ✅ **DECIDED & IMPLEMENTED (2026-08-08)** — a chars-per-page quality gate, a
+  `failed_ingestions` dead-letter table with an operator surface, and Document AI OCR as a
+  fallback extractor. All four options (b), (c) and (d) shipped; (d) **reverses** this entry's
+  original call, deliberately — see below.
+- **Was:** The exception propagated, the transaction rolled back, the user got an HTTP error, and
+  nothing was recorded. A scanned PDF ingested "successfully" as a near-empty document — a
+  **silent** corpus hole. The only check was "zero segments" in `load_file`, and because
+  `PdfLoader` skips blank pages it fired only when *every* page was blank. A 340-page scan with
+  one text cover page sailed through.
+- **Decision taken (b) — the gate divides by the right number.** `chars_per_page` uses the PDF's
+  own page count, read from the page tree, not the number of segments. Segments are the pages that
+  *worked*; dividing by them computes the density of exactly the pages that were fine and reports
+  a healthy number for a document that is 95% images. Below 50 chars/page the upload is rejected
+  with the measurements that justify it — density, page count, and how many pages produced any
+  text — so "this is a scan" is distinguishable from "your threshold is wrong". PDFs only:
+  Markdown and HTML have no pages and no scanner, and a gate there would just reject short
+  documents.
+- **Decision taken (c) — failures became countable.** `ingestion_jobs.error` was one free-text
+  sentence, overwritten each attempt. It destroyed the attempt *history* ("timed out, timed out,
+  then a parse error" collapsed into one row) and could not be grouped, because it embeds
+  filenames and page numbers — so this entry's own **Proof** was unanswerable. `failed_ingestions`
+  is append-only, one row per attempt, with a closed-vocabulary `reason`, the pipeline `stage`,
+  the gate's measurements, and `is_terminal`. `GET /documents/failures` and
+  `POST /documents/failures/{id}/retry` are the operator surface; retry is nearly free because a
+  failed job already retains its payload.
+- **Decision taken — non-retryable failures stop retrying.** arq retries whatever raises, so a
+  scanned PDF was parsed and rejected three times. Failures are now classified, and only those
+  whose answer could plausibly differ next time are re-raised. This was worth doing on worker
+  time alone and became necessary once OCR made a wasted attempt cost money.
+- **Decision taken (d) — OCR, reversing the original call.** This entry said "reject a PDF
+  yielding < ~50 chars/page with a clear *this looks scanned; OCR is not supported* error". That
+  was right when the alternative was silence and wrong as a resting place: rejection is a better
+  failure, not a capability. Google Document AI **Layout Parser** is now the fallback extractor —
+  chosen over the 6× cheaper Enterprise Document OCR because it is the only general-purpose
+  processor that reads OOXML, which is what also makes `.xlsx`/`.pptx` ingestible for the first
+  time rather than only fixing scans.
+- **Trade-off accepted:** ingestion now has a paid, network-dependent branch. It is bounded
+  deliberately — OCR runs *last*, only when the gate fails or no local parser exists, so the
+  common document costs nothing; `DOCUMENTAI_MAX_PAGES` refuses an oversized document before the
+  first billable call; and a successful extraction is cached on the job row so a failure at the
+  embedding stage does not re-buy it. The gate's threshold is one number standing in for
+  "is this a real document", and it will misjudge a legitimately sparse PDF (a slide export, a
+  photo album with captions); the fix there is to raise `INGESTION_MIN_CHARS_PER_PAGE`, and the
+  failure is loud, which is the property being bought.
+- **Deliberately not taken:** Layout Parser's own chunker. It returns RAG-ready chunks and taking
+  them would hand chunk boundaries to a remote, versioned, partly-generative service. Boundaries
+  are pinned by `CHUNKER_VERSION`, they are a silent input to every stored vector, and the A2
+  resume cursor is only meaningful because re-deriving the chunk list produces the identical list.
+  Both break at once, and nothing downstream could detect it. `enable_image_annotation` /
+  `enable_table_annotation` are off for the same reason — the obvious next lever for a
+  figure-heavy corpus, but a deliberate one with a version bump attached.
+- **Proof (measured, not asserted):** 65 tests across the gate, classification, dead-letter,
+  extractor and escalation policy; suite 235 → 300. A 20-page PDF with one 400-character text
+  page measures **20.0 chars/page** against a threshold of 50 — while that one page on its own is
+  400 chars, which is exactly the number the naive denominator would have reported and passed.
+  It fails on attempt **1** (not 3 — it is non-retryable), writes one terminal
+  `failed_ingestions` row carrying `page_count=20`, `pages_with_text=1` and `chars_per_page`, and
+  creates **zero** `documents` rows. A 40-page PDF shards into **15 + 15 + 10** calls with
+  segment pages landing at **1, 16, 31** — without the offset every citation past page 15 would
+  point at the wrong page, and no "did it extract text" assertion would notice. Escalation is
+  asserted on call *counts*, because that is what costs money: a readable PDF makes **0**
+  Document AI calls, and a job that fails after extraction still makes **1**, not 2. Failure rate
+  by cause is now `SELECT reason, count(*) FROM failed_ingestions GROUP BY reason`.
+- **Unproven, and worth saying so:** every Document AI number above comes from a fake client
+  built on the real protos. The mapping, the sharding arithmetic and the escalation policy are
+  tested; a real API round trip, the batch path, and the actual per-page bill are not.
+- **Follow-ups this opened:** the gate's threshold is unvalidated against a real corpus — the
+  number to watch is the distribution of `chars_per_page` across ingested documents, not the
+  count of rejections; `failed_ingestions` has no retention policy, same as the payloads it
+  describes; batch OCR through Cloud Storage is implemented but only exercised by unit tests, so
+  it is unproven against a real 500-page scan; and `metadata->>'extraction_method'` now
+  distinguishes OCR'd text from parsed text, which makes "does OCR'd content retrieve worse?" a
+  measurable question that nobody has yet measured.
 
 ---
 
@@ -955,8 +1022,10 @@ paid for on every write.
 - **State:** ❌
 - **Now:** No confidence scoring, no fallback retrieval path, no canary or staged rollout, no
   escalation. Live failure modes identified in this report: filtered-ANN under-return (D3),
-  mixed-embedding-model ranking (C5), silent empty-text ingestion (A6), unbounded context (E8),
-  prompt injection via retrieved content (F5).
+  mixed-embedding-model ranking (C5), ~~silent empty-text ingestion (A6)~~ **— closed 2026-08-08;
+  it now fails loudly, and its "assert the system degrades loudly rather than silently" test is
+  the one this entry asks for**, unbounded context (E8), prompt injection via retrieved
+  content (F5).
 - **Call:** Write them down as a **failure-mode table with detection and mitigation for each** —
   this document's D3/C5/A6 entries are the start. Then add the two cheapest controls: a retrieval
   confidence score (E6) and a fallback from dense to keyword when dense returns nothing. Reliability
@@ -1068,7 +1137,8 @@ in the report.*
 11. **B1 + B2** — chunking sweep, decided by numbers.
 
 ### Tier 3 — Operational envelope
-12. **A2 + A6 + B4** — async ingestion, quality gates, re-index CLI.
+12. ~~**A2 + A6 + B4** — async ingestion, quality gates, re-index CLI.~~ **Done.** A2 and B4
+    2026-08-07; A6 2026-08-08, going past its own recommendation to add OCR.
 13. **H7** — Dockerfile, CI, deploy, real readiness probe.
 14. **H5 + H3 + H4** — metrics, latency budget, cost aggregation and rate limiting.
 15. **F3 + F4 + F5** — citation validation, streaming, injection isolation.

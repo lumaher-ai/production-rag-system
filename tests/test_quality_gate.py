@@ -22,7 +22,6 @@ from httpx import AsyncClient
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from production_rag.config import get_settings
 from production_rag.exceptions import LowTextYieldError
 from production_rag.ingestion import quality
 from production_rag.ingestion.loaders import ExtractedSegment, load_file
@@ -206,7 +205,10 @@ def test_threshold_is_configurable() -> None:
 
     assert not quality.passes(report, min_chars_per_page=50)
     assert quality.passes(report, min_chars_per_page=1)
-    assert get_settings().ingestion_min_chars_per_page == 50
+    # The shipped default, asserted against the constant rather than against
+    # get_settings() — the latter reads the developer's .env, which would make
+    # this pass or fail for reasons that have nothing to do with the gate.
+    assert quality.DEFAULT_MIN_CHARS_PER_PAGE == 50
 
 
 def test_assess_never_raises_on_an_empty_result() -> None:
