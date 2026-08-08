@@ -251,19 +251,29 @@ def unsupported_type_message(filename: str | None, *, ocr_available: bool) -> st
     )
 
 
-def load_file(
+def extract_local(
     content: bytes,
     filename: str | None,
     content_type: str | None,
 ) -> list[ExtractedSegment]:
-    """Dispatch to the right *local* loader and return non-empty text segments.
+    """Parse with the local loader, returning **possibly zero** segments.
 
-    Raises ``UnsupportedFileTypeError`` (415) for unknown formats and
-    ``ValidationError`` (422) when nothing extractable is found.
+    An empty result is a *measurement*, not an error. A PDF that yields nothing
+    at all is the strongest available signal that it is a scan — every page an
+    image — and that is precisely the document a remote extractor exists to
+    rescue. Raising here would make the most common scanned document
+    unreachable by the fallback built for it, which is exactly the bug this
+    split fixes.
 
-    Local only, by design: this is the free, synchronous, deterministic path.
-    Formats that need a remote extractor are routed by ``ingestion.extraction``,
-    which calls this first and falls back only when it has to.
+    Deciding what an empty result *means* belongs to the caller, which knows
+    whether OCR is available. ``load_file`` is the strict wrapper for callers
+    that have no such option.
+
+    Still raises ``UnsupportedFileTypeError`` (415): "no loader for this format"
+    is genuinely an error and no measurement can follow it.
+
+    Local only, by design — free, synchronous, deterministic. Formats that need
+    a remote extractor are routed by ``ingestion.extraction``.
     """
     loader = resolve_loader(filename, content_type)
     if loader is None:
@@ -273,13 +283,28 @@ def load_file(
         )
 
     segments = [seg for seg in loader.extract(content, filename or "") if seg.text.strip()]
-    if not segments:
-        raise ValidationError("No extractable text found in the uploaded file.")
-
     logger.info(
         "file_extracted",
         filename=filename,
         loader=type(loader).__name__,
         segment_count=len(segments),
     )
+    return segments
+
+
+def load_file(
+    content: bytes,
+    filename: str | None,
+    content_type: str | None,
+) -> list[ExtractedSegment]:
+    """``extract_local``, but an empty result is an error.
+
+    Raises ``UnsupportedFileTypeError`` (415) for unknown formats and
+    ``ValidationError`` (422) when nothing extractable is found. For callers
+    with no fallback to escalate to, which is every caller except the
+    extraction orchestrator.
+    """
+    segments = extract_local(content, filename, content_type)
+    if not segments:
+        raise ValidationError("No extractable text found in the uploaded file.")
     return segments

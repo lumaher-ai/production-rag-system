@@ -114,6 +114,45 @@ async def test_markdown_never_reaches_ocr_however_short() -> None:
     assert result.report.method == METHOD_LOCAL
 
 
+# ─── A *fully* scanned PDF is the main event, and used to be unreachable ───
+
+
+async def test_a_fully_scanned_pdf_reaches_ocr() -> None:
+    """Found on the first real scanned upload: it never got here.
+
+    Every page an image means the local parser returns *zero* segments, and the
+    old code raised "No extractable text found" from the loader — before the
+    gate measured anything and before escalation could run. The fallback built
+    for scanned documents was reachable only by half-scanned ones.
+    """
+    ocr = SpyExtractor(segments=_dense(8))
+    result = await extract_segments(
+        make_scanned_pdf(8, text_pages=0), "scan.pdf", PDF_MIME, _ocr_on(), ocr=ocr
+    )
+
+    assert ocr.calls == [("scan.pdf", PDF_MIME)]
+    assert result.used_ocr is True
+    assert len(result.segments) == 8
+
+
+async def test_a_fully_scanned_pdf_without_ocr_explains_what_it_is() -> None:
+    """The bare "nothing found" said nothing about why or what would fix it."""
+    with pytest.raises(LowTextYieldError) as excinfo:
+        await extract_segments(
+            make_scanned_pdf(8, text_pages=0), "scan.pdf", PDF_MIME, _ocr_off()
+        )
+
+    assert "Every page is an image" in excinfo.value.detail
+    assert "scanned document" in excinfo.value.detail
+    assert "OCR_ENABLED=true" in excinfo.value.detail
+
+
+async def test_an_empty_text_file_is_still_rejected() -> None:
+    """Relaxing the loader must not let a genuinely empty document through."""
+    with pytest.raises(LowTextYieldError):
+        await extract_segments(b"   \n  ", "empty.txt", "text/plain", _ocr_off())
+
+
 # ─── A scan escalates, once ───
 
 

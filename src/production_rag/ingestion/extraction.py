@@ -29,7 +29,7 @@ from production_rag.ingestion.loaders import (
     LOADER_REGISTRY,
     OCR_CAPABLE_MIMES,
     ExtractedSegment,
-    load_file,
+    extract_local,
     resolve_mime,
     unsupported_type_message,
 )
@@ -128,23 +128,41 @@ async def extract_segments(
         )
 
     # ─── Local first ───
-    segments = load_file(content, filename, content_type)
+    # `extract_local`, not `load_file`: a document that yields *nothing* must
+    # reach the escalation below rather than raising here. A fully scanned PDF —
+    # every page an image — is the single most common thing OCR exists to
+    # rescue, and it is exactly the case that produces zero segments. Raising on
+    # empty would make the fallback unreachable by the documents it was built
+    # for, while still working for the half-scanned ones.
+    segments = extract_local(content, filename, content_type)
     report = quality.assess(segments, content=content, mime_type=mime, method=METHOD_LOCAL)
     logger.info("extraction_assessed", filename=filename, **report.as_diagnostics())
 
-    if quality.passes(report, min_chars_per_page=threshold):
+    if segments and quality.passes(report, min_chars_per_page=threshold):
         return ExtractionResult(segments=segments, report=report)
 
-    # ─── Local parsing produced almost nothing — escalate if we can ───
+    # ─── Local parsing produced nothing, or nearly nothing — escalate if we can ───
     if extractor is not None and mime in OCR_CAPABLE_MIMES:
         logger.info(
             "extraction_escalating_to_ocr",
             filename=filename,
             chars_per_page=report.chars_per_page,
+            segments_found=len(segments),
             threshold=threshold,
         )
         return await _extract_with_ocr(
             extractor, content, filename, mime, settings, threshold, local_report=report
+        )
+
+    if not segments:
+        # No density to quote — there is no text at all. Say what that usually
+        # means and what would fix it, rather than the bare "nothing found" this
+        # used to raise.
+        raise LowTextYieldError(
+            f"No extractable text found in '{filename}'. Every page is an image, "
+            f"which is what a scanned document looks like to a PDF parser. "
+            f"{_remedy(settings, ocr_attempted=False)}",
+            report=report,
         )
 
     raise quality.rejection(
