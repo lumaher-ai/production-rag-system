@@ -50,6 +50,12 @@ query is a sequential scan), no file loaders." That was false and understated th
 that under-claims is as much an accuracy defect as one that over-claims. Both have been reconciled
 against verified state, and the roadmap now carries a banner pointing here.
 
+**Also corrected 2026-08-08:** the supported-format list above is now PDF / DOCX / HTML / Markdown
+/ text **plus XLSX / XLSM / PPTX**, the last three reachable only where Document AI is configured
+(**A6**). "Supported" is therefore a property of a deployment rather than of the codebase, which
+is why `POST /documents/upload` answers 415 or 202 for the same spreadsheet depending on whether
+credentials are present.
+
 So the honest gap is narrower and sharper than the roadmap implies. **Phases 1 and 2 are done.**
 What remains is: retrieval quality (Part E), the measurement layer that would justify any of it
 (Part G), and the operational envelope (Part H).
@@ -62,59 +68,209 @@ What remains is: retrieval quality (Part E), the measurement layer that would ju
 
 ### A1. What are the authoritative sources, and how does content enter?
 
-- **State:** ⚠️
-- **Now:** One path — an authenticated user uploads a file or posts JSON. No connectors, no crawl,
-  no scheduled pull. `source` is a free-text string (the filename).
-- **Options:** (a) user-upload only; (b) + URL/web ingestion; (c) + object-store sync (S3/GDrive);
-  (d) + CDC/event-driven from a system of record.
-- **Call:** Stay at (a) and **say so explicitly** as a scope boundary, but make `source` a real URI
-  (`upload://<user>/<filename>`, `s3://…`, `https://…`) now. Retrofitting an identity scheme after
-  a second connector exists is a migration; choosing the shape today is free.
-- **Proof:** N/A — this is a scope declaration, not a measurement. Its correctness shows up as the
-  absence of a painful migration later.
+- **State:** ✅ **DECIDED & IMPLEMENTED (2026-08-07)** — upload + URL + Google Drive, one-shot pull,
+  app-level credentials, `source` as a real URI.
+- **Was:** One path — an authenticated user uploaded a file. `source` was a free-text bare filename.
+- **Decision taken:** (a) + (b) + partial (c). Scope went past this report's original
+  recommendation, deliberately: the connector interface is only proven by a second and third
+  implementation, and the URI scheme is only load-bearing once more than one scheme exists.
+  - **`upload://<user_id>/<filename>`** — minted server-side by `build_upload_uri`. The authority
+    is the owner's **UUID, not their name**: `User.name` is mutable and non-unique and `User.email`
+    is mutable PII, so either would change the source string on a rename and silently break
+    `(user_id, source)` identity — the next upload of an unchanged file would duplicate rather than
+    replace. Filenames are percent-encoded with `safe=""`, so `a/b.pdf` cannot forge path structure.
+  - **`https://…`** via `HttpConnector` — redirects followed **by hand** so every hop is
+    SSRF-checked (see below), response streamed against `max_upload_bytes`, plaintext `http://`
+    refused unless explicitly enabled.
+  - **`gdrive://<file_id>`** via `GoogleDriveConnector` — app-level service account. Google-native
+    Docs are **exported as HTML**, not plaintext, so `HtmlLoader` recovers heading structure and the
+    file keeps its `section` provenance; Slides export as text; other Google types are refused with
+    a specific message rather than a generic failure.
+  - **`s3://` deliberately not shipped.** It parses as a known-but-unsupported scheme and returns a
+    422 naming what *is* supported, rather than a confusing 500.
+- **Credentials: app-level, from `Settings`.** Every user's pull runs as the same server identity,
+  so the system reaches only what the server can see. Per-user OAuth would need a token table,
+  encryption at rest, and a consent flow — a scope boundary, stated rather than implied.
+- **Sync: one-shot pull.** `POST /documents/ingest` fetches now and returns; re-syncing means
+  calling again, which is cheap because the existing content-hash gate short-circuits unchanged
+  content before any embedding spend. Scheduled/CDC sync stays blocked on **A2** (async ingestion) —
+  polling on a synchronous request path would be the wrong foundation.
+- **Security — this endpoint is an SSRF surface.** An authenticated caller naming an arbitrary URL
+  makes the server fetch it and hands back the body as a document. `_assert_public_address` resolves
+  the host and rejects private, loopback, link-local, reserved, multicast, and unspecified
+  addresses — checking **every** A record, and re-checking **each redirect hop**, since automatic
+  redirect-following would validate only the caller's original URL. The residual DNS-rebinding
+  window is documented in the code rather than papered over. `allow_private_network_sources` exists
+  solely so tests and local development can fetch loopback, and says so in its own description.
+- **Migration:** `a1f7c2e94b31` deletes existing documents (chunks cascade) and clears `query_cache`.
+  Pre-URI rows hold bare filenames that the new upload path cannot match, so they would duplicate on
+  re-upload. With no production data, a clean reset is more honest than backfilling rows nobody
+  depends on. `downgrade()` is a documented no-op — deleted data does not come back.
+- **Proof:** 48 tests. The load-bearing ones: a re-ingest of the same URI returns the *same document
+  id* with one row in the table; an upload and a URL fetch of the same filename stay *distinct*
+  documents (the scheme is doing real work); six private-address forms are refused end-to-end
+  through the route with a 502; percent-encoded and over-long filenames still round-trip through
+  `parse_source_uri`.
+- **Follow-ups this opened:** the `source` column is now structured data with an unenforced shape
+  (a CHECK constraint or a parse-on-load validator would close that); and `A2` matters more now,
+  since a URL fetch adds unbounded network time to an already-synchronous ingest transaction.
 
 ### A2. Is ingestion synchronous with the request, or queued?
 
-- **State:** ❌ — **the most under-appreciated gap in the repo.**
-- **Now:** `POST /documents/upload` runs load → chunk → *embed the entire document* → write, inline
-  in the HTTP request, in one transaction. A 10 MiB PDF (`max_upload_bytes`) is thousands of chunks
-  and a multi-second-to-minute embedding call, holding a DB transaction open the whole time.
-- **Options:** (a) keep synchronous; (b) background task (FastAPI `BackgroundTasks`); (c) real queue
-  (Celery/arq/Redis) with an `ingestion_jobs` table and a status endpoint; (d) durable workflow.
-- **Call:** **(c)**, with an `ingestion_jobs` row (`pending → running → succeeded/failed`, error
-  text, chunk counts) and `GET /documents/{id}/status`. This is the decision that makes the system
-  survive a real corpus. It also unlocks retry-on-partial-failure, which (a) cannot express.
-- **Proof:** P95 upload latency for a 200-page PDF; transaction-duration histogram; ingestion
-  success rate and mean retries per document.
+- **State:** ✅ **DECIDED & IMPLEMENTED (2026-08-07)** — Redis-backed queue (**arq**), an
+  `ingestion_jobs` table, batch checkpointing with resume, and `202 + job_id`.
+- **Was:** `POST /documents/upload` ran load → chunk → embed *every* chunk → write inline in the
+  HTTP request, in one transaction. Measured on a real 384-page PDF: 21s fetch + 12s parse +
+  embedding, ~40–60s with the transaction held open throughout. A failure at chunk 847 of 1200
+  discarded all 846 completed embeddings.
+- **Decision taken:** (c). Both ingestion endpoints now record a job and return; a worker drives it.
+  - **Queue: arq, not Celery.** The stack is async end to end, so arq tasks are plain `async def`
+    and `IngestionService` is reused unchanged. Celery is sync-first and would need `asyncio.run()`
+    per task or a gevent pool — an adapter layer wrapped around the actual work. Celery's name
+    recognition is real; being able to say *why not Celery* is the better signal.
+  - **Payload staging: Postgres `bytea` on the job row.** A worker cannot read the request's
+    `UploadFile`. Bytes stage transactionally with the job and are cleared on success. Connector
+    sources (`https://`, `gdrive://`) stage nothing — the worker re-fetches the URI, so a 100 MiB
+    blob never touches the database for any source that has an address.
+  - **Resume: batch checkpointing.** Chunks are embedded and committed 100 at a time, advancing
+    `processed_chunks`. **Chunking is deterministic** for a given (content, `chunker_version`), so a
+    retry re-derives the same chunk list and skips that many — resume needs no persisted chunk text,
+    only the counter. `chunker_version` is stored per job; if it moves between attempts the cursor is
+    meaningless and the job restarts from zero rather than splicing two chunkings together.
+- **This also closed C4.** Batching bounds each embedding request; the previous code sent every
+  chunk of a document in one call with no cap.
+- **Two defects found by end-to-end testing, not by the test suite** — both worth more than the
+  feature itself as evidence of what verification catches:
+  1. **arq does not rescue a job whose worker was killed.** `retry_jobs` covers a task that *raises*;
+     a `kill -9` raises nothing, so the row sat in `running` forever with no retry ever coming.
+     Fixed with a `heartbeat_at` column and a `recover_stale_jobs` cron that re-queues jobs whose
+     heartbeat has gone stale. Staleness is measured by heartbeat, not elapsed time — using
+     `started_at` would hand a slow-but-healthy job to a second worker, and both would write the
+     same chunks.
+  2. **The arq `_job_id` dedup key silently dropped legitimate re-enqueues.** Set to
+     `ingest:<job_id>`, it made arq treat a retry of an orphaned job as a duplicate and discard it —
+     breaking the one path retries exist for. Removed: every request already mints a unique job row,
+     and running a job twice is harmless because ingestion is idempotent and resumable.
+- **Trade-off accepted:** ingestion is no longer atomic. Per-batch commits are what make resume
+  possible, so a document under ingestion is partially visible to retrieval. Harmless for a new
+  document (progressive availability); for a *replace*, old chunks drop on the first attempt so that
+  document has reduced content until the job finishes. The clean fix is an `is_ready` flag filtered
+  at retrieval, deferred because it forces a join into the hot ANN query and interacts with **D3**.
+- **Proof (measured, not asserted):** upload of a 512 KB document returned in **0.083s** versus
+  ~40–60s synchronously. Worker logs show batch commits at 100/200/…/667. Under `kill -9` at
+  200/750, the job was reclaimed by the sweeper, resumed at 300 (not 0), and the final document held
+  **750 chunks with 750 distinct indexes, 0→749** — no duplicates, no gaps, `attempts=2`, payload
+  cleared. 19 tests cover the lifecycle, resume, chunker-change restart, orphan detection, and
+  owner isolation.
+- **Follow-ups this opened:** failed jobs retain their payload (so a retry needs no re-upload) and
+  therefore need a retention policy; ~~a dead-letter surface once jobs accumulate~~ **— shipped,
+  see A6**; job cancellation; progress via SSE instead of polling; and the A1 folder case —
+  `gdrive://<folder_id>` fanning out to one job per file is natural now that a queue exists.
 
 ### A3. What normalization is applied before embedding?
 
-- **State:** ❌
-- **Now:** None. Loader output goes straight into the splitter. PDF extraction artifacts (ligatures,
-  hyphen-broken words, repeated headers/footers, page numbers), HTML boilerplate, non-breaking
-  spaces, and inconsistent Unicode all become embedded tokens.
-- **Options:** (a) none; (b) mechanical (NFKC, whitespace collapse, de-hyphenation, control-char
-  strip); (c) + boilerplate/header-footer detection; (d) + LLM-based cleanup.
-- **Call:** **(b) now, (c) for PDFs.** This is the highest quality-per-line-of-code change available
-  — embedding noise degrades *every* query forever, and no amount of reranking recovers it. Put it
-  in `ingestion/normalize.py`, applied per `ExtractedSegment` before chunking. **It must be
-  versioned into `CHUNKER_VERSION`** (or a new `normalizer_version`), or the existing idempotency
-  gate will serve vectors computed under the old rules.
-- **Proof:** Recall@10 on the golden set, before vs. after. Also: mean chunk token count should drop.
+- **State:** ✅ **DECIDED & IMPLEMENTED (2026-08-07)** — mechanical NFKC + whitespace, versioned into
+  the idempotency gate, applied to documents *and* queries.
+- **Was:** None. Loader output went straight into the splitter, so ligatures, non-breaking spaces,
+  zero-width joiners, `\r\n`, and column-layout space runs all became embedded tokens.
+- **Decision taken:** (b), in `ingestion/normalize.py`. Six ordered rules: NFKC → unify line endings
+  → strip invisibles and control characters → collapse intra-line whitespace → cap blank runs at one
+  → trim. Segments that normalize to empty are dropped. Rule order is load-bearing: **line-ending
+  conversion must precede the control-character strip**, because `\r` *is* a control character, so
+  stripping first deletes a lone `\r` and silently loses that line break. A unit test caught this.
+- **Applied inside `build_chunks`, not as a step before it.** That follows the principle
+  `ingestion/idempotency.py` already states about its key functions — a caller must have no way to
+  skip it. It also keeps `char_start`/`char_end` truthful, since chunks and the stored
+  `Document.content` come from the same normalized string.
+- **Queries are normalized too**, under identical rules. Skipping that leaves an asymmetry that
+  never errors: the corpus is NFKC-folded, so a question containing `ﬁ` would be embedded against
+  text that no longer holds that character, and it would surface only as quietly worse recall.
+
+**Why `normalizer_version` is load-bearing, precisely.** `content_hash` is computed over
+*normalized* text, so a rules change that alters a document changes its hash and trips the gate on
+its own — the hash is the more precise detector. The version is not redundant with it, for three
+reasons the hash cannot cover:
+
+1. **The query side is never hashed.** A normalized question is embedded and discarded, so the
+   version is the only thing that can invalidate a cached answer when the rules move. It is
+   therefore a mandatory keyword of `query_idempotency_key`.
+2. **Targeted re-processing.** "Which documents predate the fix?" is an indexed column comparison
+   (`DocumentRepository.find_stale`), not a re-normalize-the-corpus-and-diff.
+3. **Robustness to a plausible refactor.** Hashing raw bytes instead of normalized text is a
+   tempting optimization — it would let you skip re-parsing. The moment someone does that, the
+   version is the only thing standing between them and silently mixed embeddings.
+
+- **NFKC is lossy and that is accepted:** `x²→x2`, `½→1⁄2`, `𝐀→A`. Chosen because the retrieval win
+  (a search for `file` matching a PDF's `ﬁle`) outweighs math fidelity for a prose-heavy corpus. A
+  test pins this so a future change to it is deliberate; a math-heavy corpus would want NFC, which
+  would be a different normalizer and therefore a different version string.
+- **Existing rows were stamped `'none'`, not the current version** — the single easiest thing to get
+  wrong here. Stamping them current would mark un-normalized content as up to date and permanently
+  hide it from the gate, which is exactly the failure this column exists to prevent.
+- **`reindex` CLI** — `find_stale` → one ingestion job per document, reusing A2's queue, resume, and
+  status machinery rather than a second ingestion path. This needed a third branch in
+  `_materialize`: a re-index of an `upload://` document has neither staged payload (cleared on
+  success) nor a fetchable URI, so it falls back to the stored `Document.content` — which is the
+  *joined* segment text, so **page/section provenance cannot be recovered**. The worker logs that per
+  document, and distinguishes "provenance lost" from "there was none to lose."
+- **Proof (measured on the real corpus):** all 6 documents re-indexed from `none` → `nfkc-ws-v1`.
+  The arXiv paper and Drive playbook kept full page provenance through the re-fetch path (52/52 and
+  22/22 chunks with `page` set); the three `upload://` `.txt` documents used the stored-body path and
+  correctly logged that they had no provenance to lose. One document's chunk count dropped 233→227 —
+  normalization collapsing whitespace, in the predicted direction. 179 tests pass, including the
+  central regression: bump `NORMALIZER_VERSION`, re-ingest identical bytes, assert it re-embeds
+  instead of short-circuiting.
+- **A real hazard this exposed, worth keeping:** during verification a *stale worker process* from an
+  earlier session — running code from before normalization existed — consumed one re-index job,
+  applied the old gate, and reported `succeeded` without doing anything. Nothing in the queue, the
+  job row, or the logs flagged it. This is the generic risk of any queue with rolling deploys: mixed
+  code versions consuming the same jobs. It is also a live argument *for* the version column, since
+  the affected document remained visibly stale (`normalizer_version='none'`) and the next
+  `reindex --dry-run` surfaced it immediately. Worth a follow-up: workers should record their code
+  version on the jobs they complete.
+- **Open:** recall impact is unmeasured. The claim that normalization improves retrieval is
+  reasonable and standard, but it is exactly the kind of thing **Part G** exists to prove.
 
 ### A4. What metadata is attached to a chunk, and where does it come from?
 
-- **State:** ⚠️
-- **Now:** Structural only — `page`, `section`, `char_start/end`, `document_title`, `owner_id`.
+- **State:** ✅ — extractive metadata in a JSONB column, GIN-indexed.
+- **Was:** Structural only — `page`, `section`, `char_start/end`, `document_title`, `owner_id`.
   Good provenance; **zero semantic or governance metadata.** No document type, date, author,
   language, entities, sensitivity/classification label.
 - **Options:** (a) structural only; (b) + extractive (regex/heuristic: dates, doc type, language);
   (c) + model-derived (NER, classification, topic); (d) + LLM-generated summaries/keywords per chunk.
-- **Call:** **(b) now, and add a `metadata JSONB` column** rather than more typed columns — you do
-  not yet know which fields matter, and JSONB + a GIN index lets filtering evolve without a
-  migration per field. Defer (c)/(d) until a filter or eval failure demands them.
-- **Proof:** This is enabling infrastructure. Its payoff is measured in E4 (filtering) and H8
-  (governance) — a chunk-level ACL is impossible without it.
+- **Call:** **(b), in a `metadata JSONB` column** rather than more typed columns — which fields
+  matter is not yet known, and JSONB + a GIN index lets filtering evolve without a migration per
+  field. (c)/(d) stay deferred until a filter or eval failure demands them.
+- **Now:** `ingestion/metadata.py` extracts `language` (langdetect, seed-pinned), `document_date`
+  (regex; ISO + Spanish/English long forms), `doc_type` (weighted bilingual markers → `contract`,
+  `invoice`, `resume`, `report`, `policy`, `email`, `manual`, or `other`) and `mime_type`, into
+  `metadata JSONB` on both `documents` and `document_chunks`. The chunk copy is denormalized for
+  the same reason `owner_id` and `document_title` are: the ANN query filters without a join.
+
+**Three things that turned out to matter more than the column itself:**
+
+1. **Absent, not null.** Extractors return `None` rather than guessing, and null keys are *omitted*
+   from the stored document. Containment distinguishes the two — `metadata @> '{"language": null}'`
+   matches a stored null but not an absent key — so storing nulls would build a filter that matches
+   documents precisely because detection failed on them. The same logic makes rows that predate
+   extraction (`{}`) correctly invisible to every filter: unknown is not "matches".
+2. **The detector needed guards on both sides.** langdetect only raises on input with *no* features;
+   given a column of part numbers it answers, confidently, `hr` at p=0.86. So an input guard
+   (alphabetic ratio ≥ 0.5) and an output guard (top probability ≥ 0.90) sit around it. Real prose
+   in any script clears both at ~0.9999; reference tables clear neither.
+3. **`METADATA_VERSION` is deliberately NOT in the idempotency gate**, unlike `normalizer_version` /
+   `chunker_version` / `embedding_model`. Those three are silent inputs to a stored *vector*.
+   Extracted metadata never reaches the embedding model, so gating on it would turn adding one
+   keyword to a marker list into a full-corpus re-embed. Unchanged content whose `extractor_version`
+   has moved gets its metadata refreshed in place instead — two UPDATEs, no embedding spend. The
+   version travels *inside* the JSONB, so "which rows predate the current extractor?" is
+   `WHERE metadata->>'extractor_version' IS DISTINCT FROM 'extractive-v1'` — no migration, which is
+   the whole argument for the column restated as a query.
+
+- **Proof:** `tests/test_metadata_extraction.py` — determinism, absent-not-guessed, and the
+  ambiguity refusals (`03/04/2024` is unparseable without a locale, so it is not parsed). Its real
+  payoff is measured in E4 (filtering) and H8 (governance).
 
 ### A5. What is a document's identity, and what does re-ingestion mean?
 
@@ -133,18 +289,79 @@ What remains is: retrieval quality (Part E), the measurement layer that would ju
 
 ### A6. What happens when a document fails to ingest?
 
-- **State:** ❌
-- **Now:** The exception propagates, the transaction rolls back, the user gets an HTTP error. Nothing
-  is recorded. A scanned PDF that yields zero extractable text ingests "successfully" as an empty
-  or near-empty document — a **silent** corpus hole.
-- **Options:** (a) status quo; (b) quality gates at ingest (min extracted chars/page, non-empty
-  segment count, detected-language check) that reject loudly; (c) + a dead-letter table and
-  operator surface; (d) + OCR fallback for image-only PDFs.
-- **Call:** **(b) immediately** — reject a PDF yielding < ~50 chars/page with a clear
-  "this looks scanned; OCR is not supported" error. Silent partial ingestion is worse than a
-  rejected upload because it corrupts recall invisibly. (c) follows naturally once A2 lands.
-- **Proof:** Ingestion failure rate by cause; count of documents with anomalously low
-  chars-per-page; empty-retrieval rate (H5) as the downstream symptom.
+- **State:** ✅ **DECIDED & IMPLEMENTED (2026-08-08)** — a chars-per-page quality gate, a
+  `failed_ingestions` dead-letter table with an operator surface, and Document AI OCR as a
+  fallback extractor. All four options (b), (c) and (d) shipped; (d) **reverses** this entry's
+  original call, deliberately — see below.
+- **Was:** The exception propagated, the transaction rolled back, the user got an HTTP error, and
+  nothing was recorded. A scanned PDF ingested "successfully" as a near-empty document — a
+  **silent** corpus hole. The only check was "zero segments" in `load_file`, and because
+  `PdfLoader` skips blank pages it fired only when *every* page was blank. A 340-page scan with
+  one text cover page sailed through.
+- **Decision taken (b) — the gate divides by the right number.** `chars_per_page` uses the PDF's
+  own page count, read from the page tree, not the number of segments. Segments are the pages that
+  *worked*; dividing by them computes the density of exactly the pages that were fine and reports
+  a healthy number for a document that is 95% images. Below 50 chars/page the upload is rejected
+  with the measurements that justify it — density, page count, and how many pages produced any
+  text — so "this is a scan" is distinguishable from "your threshold is wrong". PDFs only:
+  Markdown and HTML have no pages and no scanner, and a gate there would just reject short
+  documents.
+- **Decision taken (c) — failures became countable.** `ingestion_jobs.error` was one free-text
+  sentence, overwritten each attempt. It destroyed the attempt *history* ("timed out, timed out,
+  then a parse error" collapsed into one row) and could not be grouped, because it embeds
+  filenames and page numbers — so this entry's own **Proof** was unanswerable. `failed_ingestions`
+  is append-only, one row per attempt, with a closed-vocabulary `reason`, the pipeline `stage`,
+  the gate's measurements, and `is_terminal`. `GET /documents/failures` and
+  `POST /documents/failures/{id}/retry` are the operator surface; retry is nearly free because a
+  failed job already retains its payload.
+- **Decision taken — non-retryable failures stop retrying.** arq retries whatever raises, so a
+  scanned PDF was parsed and rejected three times. Failures are now classified, and only those
+  whose answer could plausibly differ next time are re-raised. This was worth doing on worker
+  time alone and became necessary once OCR made a wasted attempt cost money.
+- **Decision taken (d) — OCR, reversing the original call.** This entry said "reject a PDF
+  yielding < ~50 chars/page with a clear *this looks scanned; OCR is not supported* error". That
+  was right when the alternative was silence and wrong as a resting place: rejection is a better
+  failure, not a capability. Google Document AI **Layout Parser** is now the fallback extractor —
+  chosen over the 6× cheaper Enterprise Document OCR because it is the only general-purpose
+  processor that reads OOXML, which is what also makes `.xlsx`/`.pptx` ingestible for the first
+  time rather than only fixing scans.
+- **Trade-off accepted:** ingestion now has a paid, network-dependent branch. It is bounded
+  deliberately — OCR runs *last*, only when the gate fails or no local parser exists, so the
+  common document costs nothing; `DOCUMENTAI_MAX_PAGES` refuses an oversized document before the
+  first billable call; and a successful extraction is cached on the job row so a failure at the
+  embedding stage does not re-buy it. The gate's threshold is one number standing in for
+  "is this a real document", and it will misjudge a legitimately sparse PDF (a slide export, a
+  photo album with captions); the fix there is to raise `INGESTION_MIN_CHARS_PER_PAGE`, and the
+  failure is loud, which is the property being bought.
+- **Deliberately not taken:** Layout Parser's own chunker. It returns RAG-ready chunks and taking
+  them would hand chunk boundaries to a remote, versioned, partly-generative service. Boundaries
+  are pinned by `CHUNKER_VERSION`, they are a silent input to every stored vector, and the A2
+  resume cursor is only meaningful because re-deriving the chunk list produces the identical list.
+  Both break at once, and nothing downstream could detect it. `enable_image_annotation` /
+  `enable_table_annotation` are off for the same reason — the obvious next lever for a
+  figure-heavy corpus, but a deliberate one with a version bump attached.
+- **Proof (measured, not asserted):** 65 tests across the gate, classification, dead-letter,
+  extractor and escalation policy; suite 235 → 300. A 20-page PDF with one 400-character text
+  page measures **20.0 chars/page** against a threshold of 50 — while that one page on its own is
+  400 chars, which is exactly the number the naive denominator would have reported and passed.
+  It fails on attempt **1** (not 3 — it is non-retryable), writes one terminal
+  `failed_ingestions` row carrying `page_count=20`, `pages_with_text=1` and `chars_per_page`, and
+  creates **zero** `documents` rows. A 40-page PDF shards into **15 + 15 + 10** calls with
+  segment pages landing at **1, 16, 31** — without the offset every citation past page 15 would
+  point at the wrong page, and no "did it extract text" assertion would notice. Escalation is
+  asserted on call *counts*, because that is what costs money: a readable PDF makes **0**
+  Document AI calls, and a job that fails after extraction still makes **1**, not 2. Failure rate
+  by cause is now `SELECT reason, count(*) FROM failed_ingestions GROUP BY reason`.
+- **Unproven, and worth saying so:** every Document AI number above comes from a fake client
+  built on the real protos. The mapping, the sharding arithmetic and the escalation policy are
+  tested; a real API round trip, the batch path, and the actual per-page bill are not.
+- **Follow-ups this opened:** the gate's threshold is unvalidated against a real corpus — the
+  number to watch is the distribution of `chars_per_page` across ingested documents, not the
+  count of rejections; `failed_ingestions` has no retention policy, same as the payloads it
+  describes; batch OCR through Cloud Storage is implemented but only exercised by unit tests, so
+  it is unproven against a real 500-page scan; and `metadata->>'extraction_method'` now
+  distinguishes OCR'd text from parsed text, which makes "does OCR'd content retrieve worse?" a
+  measurable question that nobody has yet measured.
 
 ---
 
@@ -330,11 +547,12 @@ What remains is: retrieval quality (Part E), the measurement layer that would ju
 
 ### D3. How is recall tuned at query time, and does filtering break it?
 
-- **State:** ❌ — **the most technically interesting live gap in the system.**
-- **Now:** `hnsw.ef_search` is never set, so every query runs at pgvector's default of 40. More
-  importantly: retrieval is `WHERE owner_id = :user AND ORDER BY embedding <=> :q LIMIT k`. In
-  pgvector, an HNSW scan walks the graph and **then** the filter is applied — so if the graph's
-  first ~`ef_search` hits belong to other users, this query **returns fewer than `top_k` rows, or
+- **State:** ⚠️ — mitigated, **not yet proven**. The fix is deployed; the experiment that would
+  demonstrate it works is still outstanding, and that gap is the honest state of this decision.
+- **Was:** `hnsw.ef_search` was never set, so every query ran at pgvector's default of 40. More
+  importantly: retrieval was `WHERE owner_id = :user AND ORDER BY embedding <=> :q LIMIT k`. In
+  pgvector, an HNSW scan walks the graph and **then** applies the filter — so if the graph's
+  first ~`ef_search` hits belong to other users, the query **returns fewer than `top_k` rows, or
   none at all**, while reporting perfect success. Recall silently collapses as the number of users
   grows. This is a multi-tenant correctness bug wearing the costume of a tuning parameter.
 - **Options:** (a) raise `ef_search` per session (mitigates, never eliminates); (b) **partial
@@ -345,12 +563,39 @@ What remains is: retrieval quality (Part E), the measurement layer that would ju
   satisfied); (e) move to a store with native filtered ANN.
 - **Call:** **(d) now** — a one-line session setting that makes the filter correct, available in the
   installed pgvector. **(c) as the scale answer**, since it also gives clean tenant isolation (H8)
-  and cheap per-tenant deletion. Set `ef_search` explicitly per query (start at 100) regardless, so
-  the recall/latency trade is a decision rather than a default.
-- **Proof:** With N synthetic tenants sharing an index, measure returned-row count and Recall@10 for
-  one tenant's queries as N grows — with and without the fix. **This single experiment is a better
-  senior-engineer signal than any other item in this report**, because it demonstrates you found a
-  correctness bug that only appears under production conditions and that no unit test would catch.
+  and cheap per-tenant deletion. `ef_search` set explicitly per query regardless, so the
+  recall/latency trade is a decision rather than a default.
+- **Now:** `DocumentRepository._apply_ann_settings` emits `SET LOCAL hnsw.ef_search` (default 100,
+  `Settings.hnsw_ef_search`) and `SET LOCAL hnsw.iterative_scan = 'relaxed_order'`
+  (`Settings.hnsw_iterative_scan`) before every ANN query. `SET LOCAL` dies with the request's
+  transaction, so a pooled connection never carries them into unrelated work. Each statement runs
+  in its own savepoint: a server without the GUC (pgvector < 0.8) logs a warning and degrades
+  instead of failing. Because `relaxed_order` returns rows in approximate distance order, the query
+  is wrapped and re-sorted outside the scan — `ScoredChunk.score` is what an eval harness ranks on,
+  so its ordering cannot be left approximate.
+
+**Two things this fix taught, both worth more than the fix:**
+
+1. **A soft-failing `SET` is its own hazard.** The first implementation wrote
+   `SET LOCAL hnsw.ef_search = :ef` — a syntax error, because `SET` takes a literal and never a
+   bind parameter. Since unsupported settings are *designed* to log and continue, the malformed one
+   degraded identically: no error, no failed test, recall quietly back to unmitigated. It was found
+   by instrumenting a run, not by the suite. `test_the_hnsw_recall_settings_are_actually_in_force`
+   now reads the settings back from the server after a real search.
+2. **The HNSW index did not exist under test.** The fixtures build their schema with
+   `Base.metadata.create_all`, not Alembic, so an index declared only in a migration was absent —
+   every test query was an exact sequential scan, the one condition under which this bug *cannot*
+   reproduce. The index is now declared in `DocumentChunk.__table_args__` as well as its migration.
+
+- **Proof — still owed.** The suite verifies the mitigating settings are applied and that a filtered
+  query returns a full page, but **at test corpus size the query returns a full page with iterative
+  scan disabled too** — so it is a regression guard, not a reproduction. Reproducing the collapse
+  needs the walk to miss `ef_search` candidates repeatedly, which takes tens of thousands of
+  vectors. The real proof is unchanged: with N synthetic tenants sharing an index, measure
+  returned-row count and Recall@10 for one tenant as N grows, with and without the fix. **That
+  single experiment is still a better senior-engineer signal than any other item in this report** —
+  shipping the mitigation does not retire it, and E4's metadata predicates make it more urgent, not
+  less, since every added predicate narrows what the graph walk can return.
 
 ### D4. How are indexes built and maintained over time?
 
@@ -430,19 +675,50 @@ What remains is: retrieval quality (Part E), the measurement layer that would ju
 
 ### E4. Can retrieval be filtered by metadata?
 
-- **State:** ❌ — and there is a **dead parameter advertising it.**
-- **Now:** `DocumentService.retrieve()` and `query()` both accept `filters: dict | None`. It is
-  threaded into the answer-cache key (so different `filters` values produce different cache
-  entries) but **never applied to the query** — the docstring says "reserved for forward-compat."
-  Two callers passing different filters get correctly-separated cache entries containing
-  *identically unfiltered* results. That is worse than not having the parameter.
+- **State:** ✅ — implemented over the A4 column.
+- **Was:** ❌, **with a dead parameter advertising it.** `retrieve()` and `query()` both accepted
+  `filters: dict | None`, threaded it into the answer-cache key (so different `filters` values
+  produced different cache entries) and **never applied it to the query**. Two callers passing
+  different filters got correctly-separated cache entries containing *identically unfiltered*
+  results — worse than not having the parameter, because the next engineer would reasonably assume
+  passing `{"classification": "public"}` did something.
 - **Options:** (a) remove it until implemented; (b) implement over the A4 JSONB column; (c)
   implement and make it governance-bearing (H8).
-- **Call:** **(a) today, (b) when A4 lands.** An unimplemented filter parameter on a multi-tenant
-  retrieval API is a security-shaped footgun: the next engineer will reasonably assume passing
-  `{"classification": "public"}` does something.
-- **Proof:** A test asserting a filtered query cannot return a non-matching chunk. Once (b) lands,
-  measure filtered-ANN recall — filtering interacts with D3 and can degrade it further.
+- **Call:** **(b).** The original call here was "(a) today, (b) when A4 lands" — A4 landing first
+  reversed the order, so the parameter was implemented rather than deleted.
+- **Now:** `filters` is applied inside the vector query as JSONB containment, ANDed with the owner
+  scope, so `top_k` counts *matching* chunks instead of being eaten by non-matching ones. The
+  accepted surface is deliberately small — a flat map of scalars, validated in
+  `ingestion/metadata.py` and rejected with a 422 otherwise. Ranges and OR are not expressible and
+  are not pretended to be.
+
+**Why `@>` and not `->>`.** The intuitive form reads better and is the wrong choice:
+
+```sql
+-- Implemented. Uses ix_document_chunks_metadata_gin.
+WHERE owner_id = :uid AND metadata @> '{"language":"es","doc_type":"contract"}'::jsonb
+
+-- Equivalent result, no index.
+WHERE owner_id = :uid AND metadata->>'language' = 'es' AND metadata->>'doc_type' = 'contract'
+```
+
+Measured on 20k chunks (pgvector 0.8.2 / PG 16), `EXPLAIN ANALYZE` of the two predicates alone:
+
+```
+@>   Bitmap Heap Scan  (actual rows=800)  ->  Bitmap Index Scan on ..._metadata_gin (rows=800)
+->>  Seq Scan          (actual rows=800)      Rows Removed by Filter: 19200
+```
+
+A GIN index over `jsonb_path_ops` indexes containment, not text extraction. Making `->>` indexable
+needs one expression index **per key** — which is the per-field migration the JSONB column exists
+to avoid, reintroduced at the index layer. `jsonb_path_ops` over the default `jsonb_ops` for the
+same reason: containment is the only operator used, and the key-existence support is index bloat
+paid for on every write.
+
+- **Proof:** `tests/test_metadata_filtering.py` — a filtered query cannot return a non-matching
+  chunk (asserted per row, since an ignored filter yields a plausible result set of the right
+  size); an unmatched filter narrows to empty rather than falling open; absent keys do not match;
+  filtering does not widen the tenant boundary. Filtering interacts with D3 — see below.
 
 ### E5. Is there a second-stage reranker?
 
@@ -746,8 +1022,10 @@ What remains is: retrieval quality (Part E), the measurement layer that would ju
 - **State:** ❌
 - **Now:** No confidence scoring, no fallback retrieval path, no canary or staged rollout, no
   escalation. Live failure modes identified in this report: filtered-ANN under-return (D3),
-  mixed-embedding-model ranking (C5), silent empty-text ingestion (A6), unbounded context (E8),
-  prompt injection via retrieved content (F5).
+  mixed-embedding-model ranking (C5), ~~silent empty-text ingestion (A6)~~ **— closed 2026-08-08;
+  it now fails loudly, and its "assert the system degrades loudly rather than silently" test is
+  the one this entry asks for**, unbounded context (E8), prompt injection via retrieved
+  content (F5).
 - **Call:** Write them down as a **failure-mode table with detection and mitigation for each** —
   this document's D3/C5/A6 entries are the start. Then add the two cheapest controls: a retrieval
   confidence score (E6) and a fallback from dense to keyword when dense returns nothing. Reliability
@@ -826,14 +1104,25 @@ than having built it.
 Ordered by *what unblocks the most other decisions*, not by effort.
 
 ### Tier 0 — Correctness bugs live in the code today
-1. **D3** — filtered-ANN under-return. Multi-tenant recall silently collapses as tenants grow.
+1. ~~**D3** — filtered-ANN under-return.~~ **Mitigated, unproven.** `ef_search` +
+   `hnsw.iterative_scan` now applied per query, and the HNSW index exists under test. What remains
+   is the measurement: recall against a synthetic multi-tenant corpus large enough to reproduce the
+   collapse. Until that runs, treat the fix as plausible rather than demonstrated.
 2. **C5** — mixed embedding models rank silently and wrongly.
 3. **C2** — hardcoded `Vector(1536)` vs. swappable `settings.embedding_model`.
-4. **E4** — remove the unimplemented `filters` parameter.
+4. ~~**E4** — remove the unimplemented `filters` parameter.~~ **Done — implemented instead.** A4
+   landed first, which reversed the call: `filters` is applied as JSONB containment inside the ANN
+   query rather than deleted. See E4.
 5. **E8/H1** — bound `top_k` and the context budget.
 6. **H8(1)** — refuse to boot in production with the default JWT secret.
 
 *None of these need a new subsystem. All are latent production incidents.*
+
+**What closing two of them changed about the list.** Both were fixed by the same piece of work, and
+neither is fully retired: D3 keeps its proof obligation, and E4's filtering makes that obligation
+more pressing rather than less. The remaining four are untouched, and **C2 is now the most
+awkward** — `metadata` proved that a schema change is one migration, which removes the last excuse
+for a dimension hardcoded in three places.
 
 ### Tier 1 — Build the instrument
 7. **G1–G5** — golden dataset, retrieval metrics, generation metrics, harness, CI gate.
@@ -848,7 +1137,8 @@ in the report.*
 11. **B1 + B2** — chunking sweep, decided by numbers.
 
 ### Tier 3 — Operational envelope
-12. **A2 + A6 + B4** — async ingestion, quality gates, re-index CLI.
+12. ~~**A2 + A6 + B4** — async ingestion, quality gates, re-index CLI.~~ **Done.** A2 and B4
+    2026-08-07; A6 2026-08-08, going past its own recommendation to add OCR.
 13. **H7** — Dockerfile, CI, deploy, real readiness probe.
 14. **H5 + H3 + H4** — metrics, latency budget, cost aggregation and rate limiting.
 15. **F3 + F4 + F5** — citation validation, streaming, injection isolation.

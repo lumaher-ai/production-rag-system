@@ -1,4 +1,9 @@
+from typing import TYPE_CHECKING
+
 from fastapi import status
+
+if TYPE_CHECKING:  # pragma: no cover - import cycle exists only for type checkers
+    from production_rag.ingestion.quality import ExtractionReport
 
 
 class PaddingtonError(Exception):
@@ -19,6 +24,17 @@ class AlreadyExistsError(PaddingtonError):
     status_code = status.HTTP_409_CONFLICT
 
 
+class NotRetryableError(PaddingtonError):
+    """The request is well-formed but the target's state makes it impossible.
+
+    409 rather than 422: nothing about the request is wrong. Retrying an
+    ingestion whose staged bytes were already released is a legitimate ask
+    against a resource that has moved past being able to answer it.
+    """
+
+    status_code = status.HTTP_409_CONFLICT
+
+
 class ValidationError(PaddingtonError):
     status_code = status.HTTP_422_UNPROCESSABLE_CONTENT
 
@@ -33,3 +49,49 @@ class UnsupportedFileTypeError(PaddingtonError):
 
 class FileTooLargeError(PaddingtonError):
     status_code = status.HTTP_413_CONTENT_TOO_LARGE
+
+
+class InvalidSourceURIError(ValidationError):
+    """A source URI is malformed or names a scheme this system does not ingest.
+
+    A subclass of ValidationError (422): the caller sent something we cannot
+    parse, which is a request defect rather than an upstream failure.
+    """
+
+
+class LowTextYieldError(ValidationError):
+    """A document parsed successfully but produced too little text to be real.
+
+    A subclass of ValidationError (422) rather than a 5xx: nothing malfunctioned.
+    The file was read, the parser ran, and the answer is that this file does not
+    contain extractable text — which is a fact about the upload, so it belongs
+    with the caller.
+
+    Carries the ``ExtractionReport`` that justified the rejection so a failure
+    record can store the measurements without re-deriving them from the message.
+    """
+
+    def __init__(self, detail: str, report: "ExtractionReport") -> None:
+        super().__init__(detail)
+        self.report = report
+
+
+class SourceFetchError(PaddingtonError):
+    """A connector could not retrieve the bytes behind a source URI.
+
+    502 rather than 500: the failure is upstream (DNS, network, a 404 from the
+    origin, a blocked address), not a defect in this service.
+    """
+
+    status_code = status.HTTP_502_BAD_GATEWAY
+
+
+class ConnectorNotConfiguredError(PaddingtonError):
+    """A connector's scheme is recognised but its credentials are not configured.
+
+    503 rather than 501: the capability exists in the code and is expected to
+    work once the deployment supplies credentials — it is unavailable, not
+    unimplemented.
+    """
+
+    status_code = status.HTTP_503_SERVICE_UNAVAILABLE

@@ -10,6 +10,8 @@ from production_rag.dependencies import get_embedding_service
 from production_rag.llm.embedding_service import EmbeddingService
 from production_rag.main import app
 from production_rag.models.document import Document, DocumentChunk
+from production_rag.services import ingestion_service
+from tests._jobs import drain_jobs
 
 pytestmark = pytest.mark.asyncio(loop_scope="module")
 
@@ -35,27 +37,48 @@ async def _auth_token(client: AsyncClient, email: str) -> str:
 
 
 async def _upload(
-    client: AsyncClient, token: str, filename: str, content: bytes
+    client: AsyncClient,
+    token: str,
+    filename: str,
+    content: bytes,
+    session: AsyncSession = None,
+    queue=None,
+    embeddings=None,
 ) -> dict:
+    """Upload and run the job, returning the resulting document.
+
+    Ingestion is asynchronous: the endpoint returns 202 and a worker finishes
+    the job. These tests are about ingestion *outcomes* (idempotency, replace,
+    ownership), so the helper drives both halves and hands back the document.
+    """
     resp = await client.post(
         "/documents/upload",
         files={"file": (filename, content, "text/plain")},
         headers={"Authorization": f"Bearer {token}"},
     )
-    assert resp.status_code == 201, resp.text
-    return resp.json()
+    assert resp.status_code == 202, resp.text
+    source = resp.json()["source"]
+
+    await drain_jobs(session, queue, embeddings)
+
+    listed = await client.get("/documents", headers={"Authorization": f"Bearer {token}"})
+    return next(d for d in listed.json() if d["source"] == source)
 
 
 async def test_reupload_same_source_unchanged_skips_embedding(
-    pg_async_client: AsyncClient,
+    pg_async_client: AsyncClient, pg_session: AsyncSession, job_queue
 ) -> None:
     mock_emb = _mock_embedding_service()
     app.dependency_overrides[get_embedding_service] = lambda: mock_emb
     token = await _auth_token(pg_async_client, "idem@example.com")
     content = b"repeatable content to be chunked. " * 50
 
-    r1 = await _upload(pg_async_client, token, "notes.txt", content)
-    r2 = await _upload(pg_async_client, token, "notes.txt", content)
+    r1 = await _upload(
+        pg_async_client, token, "notes.txt", content, pg_session, job_queue, mock_emb
+    )
+    r2 = await _upload(
+        pg_async_client, token, "notes.txt", content, pg_session, job_queue, mock_emb
+    )
 
     # Same (owner, source) + identical bytes → the same document, no re-embed.
     assert r1["id"] == r2["id"]
@@ -65,21 +88,72 @@ async def test_reupload_same_source_unchanged_skips_embedding(
     app.dependency_overrides.pop(get_embedding_service, None)
 
 
+async def test_unchanged_reingest_does_not_re_extract_metadata(
+    pg_async_client: AsyncClient,
+    pg_session: AsyncSession,
+    job_queue,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The no-op path must not pay for work it will not use.
+
+    This ordering is invisible from the outside: extracting *before* the
+    idempotency gate produces byte-identical metadata and passes every other
+    test in this file, so a regression here breaks nothing and reports nothing.
+    It is pinned because the cost is not fixed. Extraction is cheap today; an
+    extractor that ever called a model would bill a request on every re-ingest
+    that decided to do nothing, and the code would still look correct.
+    """
+    calls: list[str] = []
+    real_extract = ingestion_service.extract_metadata
+
+    def counting_extract(text: str, **kwargs: object) -> dict:
+        calls.append(text[:32])
+        return real_extract(text, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(ingestion_service, "extract_metadata", counting_extract)
+
+    mock_emb = _mock_embedding_service()
+    app.dependency_overrides[get_embedding_service] = lambda: mock_emb
+    token = await _auth_token(pg_async_client, "extract-once@example.com")
+    content = b"stable body uploaded twice, unchanged. " * 50
+
+    await _upload(
+        pg_async_client, token, "stable.txt", content, pg_session, job_queue, mock_emb
+    )
+    assert len(calls) == 1, "the first ingest must extract"
+
+    await _upload(
+        pg_async_client, token, "stable.txt", content, pg_session, job_queue, mock_emb
+    )
+    assert len(calls) == 1, "an unchanged re-ingest must not extract again"
+
+    app.dependency_overrides.pop(get_embedding_service, None)
+
+
 async def test_reupload_edited_source_replaces_document(
-    pg_async_client: AsyncClient, pg_session: AsyncSession
+    pg_async_client: AsyncClient, pg_session: AsyncSession, job_queue
 ) -> None:
     mock_emb = _mock_embedding_service()
     app.dependency_overrides[get_embedding_service] = lambda: mock_emb
     token = await _auth_token(pg_async_client, "replace@example.com")
 
     original = await _upload(
-        pg_async_client, token, "contract.txt", b"original clause body here. " * 40
+        pg_async_client,
+        token,
+        "contract.txt",
+        b"original clause body here. " * 40,
+        pg_session,
+        job_queue,
+        mock_emb,
     )
     edited = await _upload(
         pg_async_client,
         token,
         "contract.txt",
         b"an entirely rewritten and much longer edited clause body here. " * 80,
+        pg_session,
+        job_queue,
+        mock_emb,
     )
 
     # Same source, different content → the SAME document, replaced in place.
@@ -109,14 +183,20 @@ async def test_reupload_edited_source_replaces_document(
 
 
 async def test_different_source_creates_new_document(
-    pg_async_client: AsyncClient,
+    pg_async_client: AsyncClient, pg_session: AsyncSession, job_queue
 ) -> None:
     mock_emb = _mock_embedding_service()
     app.dependency_overrides[get_embedding_service] = lambda: mock_emb
     token = await _auth_token(pg_async_client, "distinct@example.com")
 
-    r1 = await _upload(pg_async_client, token, "a.txt", b"alpha content here " * 30)
-    r2 = await _upload(pg_async_client, token, "b.txt", b"beta content here " * 30)
+    r1 = await _upload(
+        pg_async_client, token, "a.txt", b"alpha content here " * 30,
+        pg_session, job_queue, mock_emb,
+    )
+    r2 = await _upload(
+        pg_async_client, token, "b.txt", b"beta content here " * 30,
+        pg_session, job_queue, mock_emb,
+    )
 
     # Distinct sources → distinct documents, each embedded once.
     assert r1["id"] != r2["id"]
@@ -126,14 +206,15 @@ async def test_different_source_creates_new_document(
 
 
 async def test_chunks_carry_owner_id(
-    pg_async_client: AsyncClient, pg_session: AsyncSession
+    pg_async_client: AsyncClient, pg_session: AsyncSession, job_queue
 ) -> None:
     mock_emb = _mock_embedding_service()
     app.dependency_overrides[get_embedding_service] = lambda: mock_emb
     token = await _auth_token(pg_async_client, "owner@example.com")
 
     resp = await _upload(
-        pg_async_client, token, "owned.txt", b"owned content to chunk " * 40
+        pg_async_client, token, "owned.txt", b"owned content to chunk " * 40,
+        pg_session, job_queue, mock_emb,
     )
     doc_id = UUID(resp["id"])
 

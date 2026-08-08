@@ -1,4 +1,5 @@
 from collections.abc import AsyncIterator, Generator
+from uuid import UUID
 
 import pytest
 import pytest_asyncio
@@ -11,8 +12,35 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from production_rag.database import Base
-from production_rag.dependencies import get_db_session
+from production_rag.dependencies import get_db_session, get_job_queue
 from production_rag.main import app
+
+# ─── Job queue fixture (no Redis needed) ───
+
+
+class RecordingJobQueue:
+    """Stands in for the arq queue, recording enqueued job ids.
+
+    The suite asserts that the endpoint *hands work off* — actually running it
+    is the worker's job and is tested by driving `ingest_document` directly. That
+    split is what keeps the tests fast and Redis-free while still covering both
+    halves of the handoff.
+    """
+
+    def __init__(self) -> None:
+        self.enqueued: list[UUID] = []
+
+    async def enqueue_ingestion(self, job_id: UUID) -> None:
+        self.enqueued.append(job_id)
+
+
+@pytest.fixture
+def job_queue() -> Generator[RecordingJobQueue, None, None]:
+    queue = RecordingJobQueue()
+    app.dependency_overrides[get_job_queue] = lambda: queue
+    yield queue
+    app.dependency_overrides.pop(get_job_queue, None)
+
 
 # ─── SQLite fixture (default, fast, no Docker needed) ───
 

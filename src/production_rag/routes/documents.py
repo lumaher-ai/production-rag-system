@@ -1,17 +1,37 @@
 from pathlib import Path
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, Form, UploadFile, status
 
 from production_rag.config import Settings, get_settings
-from production_rag.dependencies import get_current_user, get_document_service
-from production_rag.exceptions import FileTooLargeError
-from production_rag.ingestion.loaders import load_file
+from production_rag.dependencies import (
+    get_current_user,
+    get_document_service,
+    get_failed_ingestion_repository,
+    get_ingestion_job_repository,
+    get_job_queue,
+)
+from production_rag.exceptions import (
+    FileTooLargeError,
+    NotRetryableError,
+    UnsupportedFileTypeError,
+)
+from production_rag.ingestion.loaders import is_ingestible, unsupported_type_message
+from production_rag.ingestion.sources import build_upload_uri, parse_source_uri
 from production_rag.models import User
+from production_rag.queue import JobQueue
+from production_rag.repositories.failed_ingestion_repository import (
+    FailedIngestionRepository,
+)
+from production_rag.repositories.ingestion_job_repository import IngestionJobRepository
 from production_rag.schemas.document import (
     DocumentResponse,
+    IngestFromUriRequest,
     QueryRequest,
     QueryResponse,
 )
+from production_rag.schemas.failure import FailureResponse
+from production_rag.schemas.job import JobAcceptedResponse, JobStatusResponse
 from production_rag.services.document_service import DocumentService
 
 router = APIRouter(prefix="/documents", tags=["documents"])
@@ -19,41 +39,177 @@ router = APIRouter(prefix="/documents", tags=["documents"])
 
 @router.post(
     "/upload",
-    response_model=DocumentResponse,
-    status_code=status.HTTP_201_CREATED,
+    response_model=JobAcceptedResponse,
+    status_code=status.HTTP_202_ACCEPTED,
 )
 async def upload_file(
     file: UploadFile = File(...),
     title: str | None = Form(default=None),
     current_user: User = Depends(get_current_user),
-    service: DocumentService = Depends(get_document_service),
+    jobs: IngestionJobRepository = Depends(get_ingestion_job_repository),
+    queue: JobQueue = Depends(get_job_queue),
     settings: Settings = Depends(get_settings),
-) -> DocumentResponse:
-    """Ingest an uploaded file (PDF/DOCX/HTML/TXT/Markdown) into the RAG store."""
+) -> JobAcceptedResponse:
+    """Queue an uploaded file for ingestion.
+
+    Returns **202 with a job id**, not the finished document. Parsing and
+    embedding a large document takes minutes; doing it here would hold the
+    connection and a database transaction open for the duration, and lose every
+    completed embedding if it failed part-way. Poll
+    ``GET /documents/jobs/{job_id}`` for progress.
+
+    Cheap checks still run synchronously — an oversized or unreadable file is
+    rejected immediately rather than becoming a job that fails later.
+    """
     content = await file.read()
     if len(content) > settings.max_upload_bytes:
         raise FileTooLargeError(
             f"File exceeds the maximum upload size of {settings.max_upload_bytes} bytes."
         )
+    # Deliberately depends on deployment state, not just on the filename: a
+    # spreadsheet is ingestible where Document AI is configured and a 415 where
+    # it is not, and saying so now beats a 202 followed by a job that fails a
+    # second later with the same message.
+    if not is_ingestible(
+        file.filename, file.content_type, ocr_available=settings.ocr_available
+    ):
+        raise UnsupportedFileTypeError(
+            unsupported_type_message(file.filename, ocr_available=settings.ocr_available)
+        )
 
-    # Raises UnsupportedFileTypeError (415) / ValidationError (422) on bad input.
-    segments = load_file(content, file.filename, file.content_type)
-
-    # Title defaults to the filename stem; an explicit form field overrides it.
     stem = Path(file.filename).stem if file.filename else "document"
-    doc_title = (title or stem or "document")[:255]
-
-    # source is the document's identity for (owner, source) replace-on-re-upload.
-    # Fall back to the title if the client omitted a filename.
-    source = (file.filename or doc_title)[:1024]
-
-    document = await service.ingest_segments(
-        title=doc_title,
-        segments=segments,
+    job = await jobs.create(
         user_id=current_user.id,
-        source=source,
+        # A real URI, so an uploaded report.pdf and one pulled from a URL of the
+        # same name remain distinct documents.
+        source=build_upload_uri(current_user.id, file.filename),
+        title=(title or stem or "document")[:255],
+        # The worker is a different process and cannot read this UploadFile, so
+        # the bytes are staged on the job row and cleared once it succeeds.
+        payload=content,
+        filename=file.filename,
+        content_type=file.content_type,
     )
-    return DocumentResponse.model_validate(document)
+    await queue.enqueue_ingestion(job.id)
+    return JobAcceptedResponse.model_validate(job)
+
+
+@router.post(
+    "/ingest",
+    response_model=JobAcceptedResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def ingest_from_uri(
+    data: IngestFromUriRequest,
+    current_user: User = Depends(get_current_user),
+    jobs: IngestionJobRepository = Depends(get_ingestion_job_repository),
+    queue: JobQueue = Depends(get_job_queue),
+) -> JobAcceptedResponse:
+    """Queue an external source (https:// or gdrive://) for ingestion.
+
+    No bytes are staged: the URI can be fetched again, so the worker re-fetches
+    it. That keeps a 100 MiB blob out of the database for every source that has
+    an address.
+
+    The URI is validated here so a malformed one is a 422 now, rather than a job
+    that fails asynchronously.
+    """
+    parsed = parse_source_uri(data.uri)
+
+    job = await jobs.create(
+        user_id=current_user.id,
+        source=parsed.uri,
+        title=data.title[:255] if data.title else None,
+    )
+    await queue.enqueue_ingestion(job.id)
+    return JobAcceptedResponse.model_validate(job)
+
+
+@router.get("/jobs", response_model=list[JobStatusResponse])
+async def list_jobs(
+    limit: int = 20,
+    current_user: User = Depends(get_current_user),
+    jobs: IngestionJobRepository = Depends(get_ingestion_job_repository),
+) -> list[JobStatusResponse]:
+    records = await jobs.list_for_owner(current_user.id, limit=min(limit, 100))
+    return [JobStatusResponse.model_validate(job) for job in records]
+
+
+@router.get("/jobs/{job_id}", response_model=JobStatusResponse)
+async def get_job(
+    job_id: UUID,
+    current_user: User = Depends(get_current_user),
+    jobs: IngestionJobRepository = Depends(get_ingestion_job_repository),
+) -> JobStatusResponse:
+    """Progress and outcome of one ingestion job.
+
+    Scoped to its owner: someone else's job id is a 404, not a 403, so the
+    endpoint does not confirm that an id exists.
+    """
+    job = await jobs.get_for_owner(job_id, current_user.id)
+    return JobStatusResponse.model_validate(job)
+
+
+@router.get("/failures", response_model=list[FailureResponse])
+async def list_failures(
+    limit: int = 20,
+    terminal_only: bool = True,
+    current_user: User = Depends(get_current_user),
+    failures: FailedIngestionRepository = Depends(get_failed_ingestion_repository),
+) -> list[FailureResponse]:
+    """Ingestions that failed — the dead-letter surface.
+
+    Defaults to terminal failures only, because the operator question is "what
+    needs me?" and a job that is about to be retried does not. Pass
+    ``terminal_only=false`` for the full attempt history, which is what tells
+    "flaky origin, succeeded on attempt three" apart from "broken document".
+    """
+    records = await failures.list_for_owner(
+        current_user.id, terminal_only=terminal_only, limit=min(limit, 100)
+    )
+    return [FailureResponse.model_validate(record) for record in records]
+
+
+@router.post(
+    "/failures/{failure_id}/retry",
+    response_model=JobAcceptedResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def retry_failure(
+    failure_id: UUID,
+    current_user: User = Depends(get_current_user),
+    failures: FailedIngestionRepository = Depends(get_failed_ingestion_repository),
+    jobs: IngestionJobRepository = Depends(get_ingestion_job_repository),
+    queue: JobQueue = Depends(get_job_queue),
+) -> JobAcceptedResponse:
+    """Re-drive a failed ingestion without re-uploading it.
+
+    Cheap because a failed job keeps its staged payload — that retention exists
+    precisely so this does not need the bytes again. Resumes from the committed
+    cursor rather than restarting, so a job that failed at chunk 847 does not
+    re-embed the first 846.
+
+    Returns 409 when there is nothing to retry *from*: an ``upload://`` job whose
+    payload was already released is unreachable, and saying so now beats a job
+    that fails again a second later with a confusing message.
+    """
+    failure = await failures.get_for_owner(failure_id, current_user.id)
+    if failure.job_id is None:
+        raise NotRetryableError(
+            "This failure's job no longer exists, so there is nothing to retry. "
+            "Re-upload the document instead."
+        )
+
+    job = await jobs.get_for_owner(failure.job_id, current_user.id)
+    if job.payload is None and not parse_source_uri(job.source).is_fetchable:
+        raise NotRetryableError(
+            f"Cannot retry '{job.source}': its bytes are not staged and the "
+            f"source cannot be fetched again. Re-upload the document instead."
+        )
+
+    await jobs.requeue(job)
+    await queue.enqueue_ingestion(job.id)
+    return JobAcceptedResponse.model_validate(job)
 
 
 @router.post("/query", response_model=QueryResponse)

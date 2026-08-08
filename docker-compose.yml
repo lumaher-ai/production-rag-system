@@ -1,7 +1,12 @@
+# Container names are prefixed with this project, not "paddington". The two repos
+# were split apart and both declared a container called `paddington-postgres`, so
+# whichever came up second failed with a name conflict — and the fix that looks
+# obvious (remove the container, re-run compose) silently attaches a *different*
+# volume, making the data appear to vanish.
 services:
   postgres:
     image: pgvector/pgvector:pg16
-    container_name: paddington-postgres
+    container_name: production-rag-postgres
     environment:
       POSTGRES_USER: paddington
       POSTGRES_PASSWORD: paddington_dev_password
@@ -16,5 +21,22 @@ services:
       timeout: 5s
       retries: 5
 
+  redis:
+    image: redis:7-alpine
+    container_name: production-rag-redis
+    ports:
+      - "6379:6379"
+    # Append-only persistence: an enqueued ingestion job that is lost on restart
+    # leaves a row stuck in 'pending' with no worker coming for it.
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - paddington_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
 volumes:
   paddington_postgres_data:
+  paddington_redis_data:

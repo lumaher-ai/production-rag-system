@@ -203,9 +203,11 @@ Ordered by production-signal-per-effort. Each item lists the concrete files to a
 - ⬜ **Embedding cache** — document-level idempotency exists; no chunk-level cache.
   Decisions doc **C4**, which also flags an unbounded `embed_batch` size as the more urgent
   half of that item.
-- ⬜ **Not in the original plan, now known to matter:** ingestion is synchronous and holds a
-  transaction across the whole embed (**A2**); there is no normalization pass (**A3**) and no
-  quality gate against silently-empty scanned PDFs (**A6**).
+- ✅ **Not in the original plan, now known to matter — all three since closed.** Ingestion was
+  synchronous and held a transaction across the whole embed (**A2**, 2026-08-07); there was no
+  normalization pass (**A3**, 2026-08-07); and a scanned PDF ingested silently as a near-empty
+  document (**A6**, 2026-08-08 — a chars-per-page gate, a `failed_ingestions` dead-letter table,
+  and Document AI OCR, which also brought `.xlsx`/`.pptx` support the original plan never had).
 
 ### Phase 3 — Hybrid retrieval + reranking
 - **Keyword search** — Postgres `tsvector` column + GIN index on chunk content.

@@ -11,6 +11,7 @@ _BASE = {
     "question": "What is Python?",
     "filters": None,
     "top_k": 5,
+    "normalizer_version": "nfkc-ws-v1",
     "chunker_version": "recursive-char-v1",
     "embedding_model": "text-embedding-3-small",
 }
@@ -39,6 +40,10 @@ def test_query_key_changes_with_every_component() -> None:
         {"question": "What is Rust?"},
         {"filters": {"doc": "x"}},
         {"top_k": 10},
+        # Each of these is a silent input to the vectors an answer was built
+        # from — a key that ignored any of them would serve an answer computed
+        # under configuration that no longer applies.
+        {"normalizer_version": "nfkc-ws-v2"},
         {"chunker_version": "recursive-char-v2"},
         {"embedding_model": "text-embedding-3-large"},
     ]

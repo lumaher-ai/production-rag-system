@@ -10,6 +10,7 @@ from production_rag.dependencies import get_embedding_service, get_llm_client
 from production_rag.llm.client import LLMClient, LLMResponse
 from production_rag.llm.embedding_service import EmbeddingService
 from production_rag.main import app
+from tests._jobs import drain_jobs
 from production_rag.models import User
 from production_rag.repositories.query_cache_repository import QueryCacheRepository
 from production_rag.services.auth_service import hash_password
@@ -104,7 +105,9 @@ async def test_cache_delete_by_user(pg_session: AsyncSession) -> None:
 # ─── Endpoint-level: cache hit / miss / invalidation ───
 
 
-async def test_identical_query_served_from_cache(pg_async_client: AsyncClient) -> None:
+async def test_identical_query_served_from_cache(
+    pg_async_client: AsyncClient, pg_session: AsyncSession, job_queue
+) -> None:
     mock_emb = _mock_embedding_service()
     mock_llm = _mock_llm_client()
     app.dependency_overrides[get_embedding_service] = lambda: mock_emb
@@ -117,6 +120,7 @@ async def test_identical_query_served_from_cache(pg_async_client: AsyncClient) -
         files={"file": ("kb.txt", b"Python is great. " * 100, "text/plain")},
         headers=headers,
     )
+    await drain_jobs(pg_session, job_queue, mock_emb)
     query = {"question": "What is Python?", "top_k": 3}
     r1 = await pg_async_client.post("/documents/query", json=query, headers=headers)
     r2 = await pg_async_client.post("/documents/query", json=query, headers=headers)
@@ -132,7 +136,9 @@ async def test_identical_query_served_from_cache(pg_async_client: AsyncClient) -
     app.dependency_overrides.pop(get_llm_client, None)
 
 
-async def test_different_top_k_misses_cache(pg_async_client: AsyncClient) -> None:
+async def test_different_top_k_misses_cache(
+    pg_async_client: AsyncClient, pg_session: AsyncSession, job_queue
+) -> None:
     mock_emb = _mock_embedding_service()
     mock_llm = _mock_llm_client()
     app.dependency_overrides[get_embedding_service] = lambda: mock_emb
@@ -145,6 +151,7 @@ async def test_different_top_k_misses_cache(pg_async_client: AsyncClient) -> Non
         files={"file": ("kb.txt", b"Rust is fast. " * 100, "text/plain")},
         headers=headers,
     )
+    await drain_jobs(pg_session, job_queue, mock_emb)
     r1 = await pg_async_client.post(
         "/documents/query", json={"question": "What is Rust?", "top_k": 3}, headers=headers
     )
@@ -160,7 +167,9 @@ async def test_different_top_k_misses_cache(pg_async_client: AsyncClient) -> Non
     app.dependency_overrides.pop(get_llm_client, None)
 
 
-async def test_ingest_invalidates_cache(pg_async_client: AsyncClient) -> None:
+async def test_ingest_invalidates_cache(
+    pg_async_client: AsyncClient, pg_session: AsyncSession, job_queue
+) -> None:
     mock_emb = _mock_embedding_service()
     mock_llm = _mock_llm_client()
     app.dependency_overrides[get_embedding_service] = lambda: mock_emb
@@ -173,6 +182,7 @@ async def test_ingest_invalidates_cache(pg_async_client: AsyncClient) -> None:
         files={"file": ("kb.txt", b"Go is simple. " * 100, "text/plain")},
         headers=headers,
     )
+    await drain_jobs(pg_session, job_queue, mock_emb)
     query = {"question": "What is Go?", "top_k": 3}
     r1 = await pg_async_client.post("/documents/query", json=query, headers=headers)  # miss
     r2 = await pg_async_client.post("/documents/query", json=query, headers=headers)  # hit
@@ -184,6 +194,7 @@ async def test_ingest_invalidates_cache(pg_async_client: AsyncClient) -> None:
         files={"file": ("more.txt", b"Go has goroutines. " * 100, "text/plain")},
         headers=headers,
     )
+    await drain_jobs(pg_session, job_queue, mock_emb)
     r3 = await pg_async_client.post("/documents/query", json=query, headers=headers)  # miss again
 
     assert r3.json()["cached"] is False
