@@ -24,6 +24,17 @@ class AlreadyExistsError(PaddingtonError):
     status_code = status.HTTP_409_CONFLICT
 
 
+class NotRetryableError(PaddingtonError):
+    """The request is well-formed but the target's state makes it impossible.
+
+    409 rather than 422: nothing about the request is wrong. Retrying an
+    ingestion whose staged bytes were already released is a legitimate ask
+    against a resource that has moved past being able to answer it.
+    """
+
+    status_code = status.HTTP_409_CONFLICT
+
+
 class ValidationError(PaddingtonError):
     status_code = status.HTTP_422_UNPROCESSABLE_CONTENT
 

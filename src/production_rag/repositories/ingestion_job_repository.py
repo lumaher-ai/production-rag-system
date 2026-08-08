@@ -132,6 +132,7 @@ class IngestionJobRepository:
         job.status = JobStatus.RUNNING.value
         job.attempts += 1
         job.error = None
+        job.failure_reason = None
         job.started_at = job.started_at or now
         job.heartbeat_at = now
         await self._session.commit()
@@ -185,18 +186,46 @@ class IngestionJobRepository:
         job.document_id = document_id
         job.payload = None
         job.error = None
+        job.failure_reason = None
         job.finished_at = datetime.now(UTC)
         await self._session.commit()
         return job
 
-    async def mark_failed(self, job: IngestionJob, error: str) -> IngestionJob:
+    async def mark_failed(
+        self, job: IngestionJob, error: str, reason: str | None = None
+    ) -> IngestionJob:
         """Record a failure, keeping the payload so a retry needs no re-upload.
 
         ``processed_chunks`` is left intact — it is the resume cursor, and
         clearing it would discard exactly the work this design exists to save.
+
+        ``reason`` is the countable form of the same failure (a FailureReason
+        value). Optional so a caller that has not classified the exception can
+        still record it, rather than being forced to guess a code.
         """
         job.status = JobStatus.FAILED.value
         job.error = error[:2000]
+        job.failure_reason = reason
         job.finished_at = datetime.now(UTC)
+        await self._session.commit()
+        return job
+
+    async def requeue(self, job: IngestionJob) -> IngestionJob:
+        """Return a failed job to 'pending' so it can be enqueued again.
+
+        ``attempts`` resets to zero because this is a *human* deciding to try
+        again, usually after fixing whatever caused the failure — carrying the
+        old count over would give the retry one attempt instead of the full
+        budget, and it would fail terminally for a reason that no longer holds.
+
+        ``processed_chunks`` does not reset: it is the resume cursor, and the
+        chunks it counts are still in the database.
+        """
+        job.status = JobStatus.PENDING.value
+        job.attempts = 0
+        job.error = None
+        job.failure_reason = None
+        job.finished_at = None
+        job.heartbeat_at = None
         await self._session.commit()
         return job

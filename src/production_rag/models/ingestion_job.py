@@ -77,6 +77,12 @@ class IngestionJob(Base):
         nullable=True,
     )
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The same failure as ``error``, as a countable value instead of a sentence.
+    # ``error`` embeds filenames and page numbers, so it can be read but not
+    # grouped; this is a FailureReason and answers "what is failing, and how
+    # often". Also lets a polling client branch on the cause rather than
+    # pattern-matching a message that is free to change.
+    failure_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
     attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     # Liveness signal, refreshed when the job is claimed and after every batch.
     # A worker killed outright (SIGKILL, OOM, pod eviction) never runs its

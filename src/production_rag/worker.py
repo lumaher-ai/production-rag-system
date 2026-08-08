@@ -22,10 +22,14 @@ from arq.connections import RedisSettings
 
 from production_rag.config import get_settings
 from production_rag.database import close_db, get_session, init_db
+from production_rag.ingestion.failures import classify, diagnostics
 from production_rag.llm.embedding_service import EmbeddingService
 from production_rag.logging_config import configure_logging, get_logger
 from production_rag.queue import INGEST_TASK, ArqJobQueue
 from production_rag.repositories.document_repository import DocumentRepository
+from production_rag.repositories.failed_ingestion_repository import (
+    FailedIngestionRepository,
+)
 from production_rag.repositories.ingestion_job_repository import (
     IngestionJobRepository,
 )
@@ -39,16 +43,23 @@ logger = get_logger(__name__)
 async def ingest_document(ctx: dict[str, Any], job_id: str) -> str:
     """Ingest one document. Idempotent and resumable.
 
-    Failures are recorded on the job row *and* re-raised: the row is what a user
-    polling for status sees, and the exception is what tells arq to retry. On
-    the final attempt the row is the only record left, which is why the message
-    is stored rather than only logged.
+    Failures are recorded in three places, because they answer three different
+    questions: the **job row** is what a user polling for status sees, the
+    **dead-letter table** is what an operator counts and re-drives, and the
+    **log** is what a developer reads.
+
+    A failure is only re-raised — which is what tells arq to retry — when
+    retrying could plausibly change the answer. A scanned PDF rejected by the
+    quality gate is still a scanned PDF on attempt three, so those return
+    normally and the job stops burning attempts (and, once OCR is in the path,
+    money) on a verdict that will not move.
     """
     settings = get_settings()
     uuid = UUID(job_id)
 
     async with get_session() as session:
         jobs = IngestionJobRepository(session)
+        failures = FailedIngestionRepository(session)
         job = await jobs.get(uuid)
 
         service = IngestionService(
@@ -65,13 +76,34 @@ async def ingest_document(ctx: dict[str, Any], job_id: str) -> str:
             # Roll back whatever the failed batch left open before writing the
             # failure, or the status update would be lost with it.
             await session.rollback()
-            await jobs.mark_failed(job, f"{type(exc).__name__}: {exc}")
+            classification = classify(exc)
+            terminal = (
+                not classification.retryable
+                or job.attempts >= settings.ingestion_max_attempts
+            )
+            message = f"{type(exc).__name__}: {exc}"
+
+            await jobs.mark_failed(job, message, reason=classification.reason.value)
+            await failures.record(
+                job,
+                classification,
+                message,
+                is_terminal=terminal,
+                diagnostics=diagnostics(exc),
+            )
             logger.exception(
                 "ingestion_job_failed",
                 job_id=job_id,
                 attempt=job.attempts,
                 processed_chunks=job.processed_chunks,
+                reason=classification.reason.value,
+                stage=classification.stage.value,
+                terminal=terminal,
             )
+            if terminal:
+                # Deliberately not re-raised: arq retries whatever raises, and
+                # there is nothing here worth retrying.
+                return ""
             raise
 
         logger.info(

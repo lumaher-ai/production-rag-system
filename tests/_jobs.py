@@ -15,9 +15,13 @@ from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from production_rag.config import Settings, get_settings
+from production_rag.ingestion.failures import classify, diagnostics
 from production_rag.llm.embedding_service import EmbeddingService
 from production_rag.models.ingestion_job import IngestionJob
 from production_rag.repositories.document_repository import DocumentRepository
+from production_rag.repositories.failed_ingestion_repository import (
+    FailedIngestionRepository,
+)
 from production_rag.repositories.ingestion_job_repository import (
     IngestionJobRepository,
 )
@@ -103,17 +107,21 @@ async def drain_expecting_failure(
     session: AsyncSession,
     queue,
     settings: Settings | None = None,
+    embeddings: EmbeddingService | None = None,
 ) -> IngestionJob:
     """Run one queued job that is expected to fail, and return its row.
 
     Mirrors what ``worker.ingest_document`` does on an exception — roll back the
-    partial transaction, then record the failure — so tests assert against the
-    same state a real failed job leaves behind.
+    partial transaction, classify the failure, write it to both the job row and
+    the dead-letter table — so tests assert against the same state a real failed
+    job leaves behind, including whether the failure was judged terminal.
     """
+    settings = settings or get_settings()
     jobs = IngestionJobRepository(session)
+    failures = FailedIngestionRepository(session)
     service = IngestionService(
         document_repository=DocumentRepository(session),
-        embedding_service=mock_embedding_service(),
+        embedding_service=embeddings or mock_embedding_service(),
         query_cache_repository=QueryCacheRepository(session),
         job_repository=jobs,
     )
@@ -121,9 +129,21 @@ async def drain_expecting_failure(
     job_id = queue.enqueued.pop(0)
     job = await jobs.get(job_id)
     try:
-        await service.run_job(job, settings or get_settings())
+        await service.run_job(job, settings)
     except Exception as exc:
         await session.rollback()
-        await jobs.mark_failed(job, f"{type(exc).__name__}: {exc}")
+        classification = classify(exc)
+        terminal = (
+            not classification.retryable or job.attempts >= settings.ingestion_max_attempts
+        )
+        message = f"{type(exc).__name__}: {exc}"
+        await jobs.mark_failed(job, message, reason=classification.reason.value)
+        await failures.record(
+            job,
+            classification,
+            message,
+            is_terminal=terminal,
+            diagnostics=diagnostics(exc),
+        )
         return job
     raise AssertionError(f"job {job_id} was expected to fail but succeeded")

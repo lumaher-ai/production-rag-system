@@ -44,7 +44,13 @@ class JobStatusResponse(BaseModel):
         "that point.",
     )
     error: str | None = Field(
-        default=None, description="Failure reason, when status is 'failed'."
+        default=None, description="Failure message, when status is 'failed'."
+    )
+    failure_reason: str | None = Field(
+        default=None,
+        description="The same failure as a countable code — low_text_yield, "
+        "fetch_failed, unsupported_type, ocr_not_configured, ... Branch on this "
+        "rather than on `error`, whose wording is free to change.",
     )
     attempts: int
     created_at: datetime

@@ -15,6 +15,9 @@ from production_rag.models import User
 from production_rag.models.enums import UserRole
 from production_rag.queue import JobQueue
 from production_rag.repositories.document_repository import DocumentRepository
+from production_rag.repositories.failed_ingestion_repository import (
+    FailedIngestionRepository,
+)
 from production_rag.repositories.ingestion_job_repository import IngestionJobRepository
 from production_rag.repositories.query_cache_repository import QueryCacheRepository
 from production_rag.repositories.refresh_token_repository import RefreshTokenRepository
@@ -127,6 +130,12 @@ def get_ingestion_job_repository(
     session: AsyncSession = Depends(get_db_session),
 ) -> IngestionJobRepository:
     return IngestionJobRepository(session)
+
+
+def get_failed_ingestion_repository(
+    session: AsyncSession = Depends(get_db_session),
+) -> FailedIngestionRepository:
+    return FailedIngestionRepository(session)
 
 
 def get_job_queue(request: Request) -> JobQueue:

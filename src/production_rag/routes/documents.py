@@ -7,14 +7,22 @@ from production_rag.config import Settings, get_settings
 from production_rag.dependencies import (
     get_current_user,
     get_document_service,
+    get_failed_ingestion_repository,
     get_ingestion_job_repository,
     get_job_queue,
 )
-from production_rag.exceptions import FileTooLargeError, UnsupportedFileTypeError
+from production_rag.exceptions import (
+    FileTooLargeError,
+    NotRetryableError,
+    UnsupportedFileTypeError,
+)
 from production_rag.ingestion.loaders import is_ingestible, unsupported_type_message
 from production_rag.ingestion.sources import build_upload_uri, parse_source_uri
 from production_rag.models import User
 from production_rag.queue import JobQueue
+from production_rag.repositories.failed_ingestion_repository import (
+    FailedIngestionRepository,
+)
 from production_rag.repositories.ingestion_job_repository import IngestionJobRepository
 from production_rag.schemas.document import (
     DocumentResponse,
@@ -22,6 +30,7 @@ from production_rag.schemas.document import (
     QueryRequest,
     QueryResponse,
 )
+from production_rag.schemas.failure import FailureResponse
 from production_rag.schemas.job import JobAcceptedResponse, JobStatusResponse
 from production_rag.services.document_service import DocumentService
 
@@ -139,6 +148,68 @@ async def get_job(
     """
     job = await jobs.get_for_owner(job_id, current_user.id)
     return JobStatusResponse.model_validate(job)
+
+
+@router.get("/failures", response_model=list[FailureResponse])
+async def list_failures(
+    limit: int = 20,
+    terminal_only: bool = True,
+    current_user: User = Depends(get_current_user),
+    failures: FailedIngestionRepository = Depends(get_failed_ingestion_repository),
+) -> list[FailureResponse]:
+    """Ingestions that failed — the dead-letter surface.
+
+    Defaults to terminal failures only, because the operator question is "what
+    needs me?" and a job that is about to be retried does not. Pass
+    ``terminal_only=false`` for the full attempt history, which is what tells
+    "flaky origin, succeeded on attempt three" apart from "broken document".
+    """
+    records = await failures.list_for_owner(
+        current_user.id, terminal_only=terminal_only, limit=min(limit, 100)
+    )
+    return [FailureResponse.model_validate(record) for record in records]
+
+
+@router.post(
+    "/failures/{failure_id}/retry",
+    response_model=JobAcceptedResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def retry_failure(
+    failure_id: UUID,
+    current_user: User = Depends(get_current_user),
+    failures: FailedIngestionRepository = Depends(get_failed_ingestion_repository),
+    jobs: IngestionJobRepository = Depends(get_ingestion_job_repository),
+    queue: JobQueue = Depends(get_job_queue),
+) -> JobAcceptedResponse:
+    """Re-drive a failed ingestion without re-uploading it.
+
+    Cheap because a failed job keeps its staged payload — that retention exists
+    precisely so this does not need the bytes again. Resumes from the committed
+    cursor rather than restarting, so a job that failed at chunk 847 does not
+    re-embed the first 846.
+
+    Returns 409 when there is nothing to retry *from*: an ``upload://`` job whose
+    payload was already released is unreachable, and saying so now beats a job
+    that fails again a second later with a confusing message.
+    """
+    failure = await failures.get_for_owner(failure_id, current_user.id)
+    if failure.job_id is None:
+        raise NotRetryableError(
+            "This failure's job no longer exists, so there is nothing to retry. "
+            "Re-upload the document instead."
+        )
+
+    job = await jobs.get_for_owner(failure.job_id, current_user.id)
+    if job.payload is None and not parse_source_uri(job.source).is_fetchable:
+        raise NotRetryableError(
+            f"Cannot retry '{job.source}': its bytes are not staged and the "
+            f"source cannot be fetched again. Re-upload the document instead."
+        )
+
+    await jobs.requeue(job)
+    await queue.enqueue_ingestion(job.id)
+    return JobAcceptedResponse.model_validate(job)
 
 
 @router.post("/query", response_model=QueryResponse)
