@@ -11,7 +11,7 @@ from production_rag.dependencies import (
     get_job_queue,
 )
 from production_rag.exceptions import FileTooLargeError, UnsupportedFileTypeError
-from production_rag.ingestion.loaders import resolve_loader
+from production_rag.ingestion.loaders import is_ingestible, unsupported_type_message
 from production_rag.ingestion.sources import build_upload_uri, parse_source_uri
 from production_rag.models import User
 from production_rag.queue import JobQueue
@@ -57,10 +57,15 @@ async def upload_file(
         raise FileTooLargeError(
             f"File exceeds the maximum upload size of {settings.max_upload_bytes} bytes."
         )
-    if resolve_loader(file.filename, file.content_type) is None:
+    # Deliberately depends on deployment state, not just on the filename: a
+    # spreadsheet is ingestible where Document AI is configured and a 415 where
+    # it is not, and saying so now beats a 202 followed by a job that fails a
+    # second later with the same message.
+    if not is_ingestible(
+        file.filename, file.content_type, ocr_available=settings.ocr_available
+    ):
         raise UnsupportedFileTypeError(
-            f"Unsupported file type for '{file.filename}'. "
-            f"Supported: PDF, DOCX, HTML, TXT, Markdown."
+            unsupported_type_message(file.filename, ocr_available=settings.ocr_available)
         )
 
     stem = Path(file.filename).stem if file.filename else "document"

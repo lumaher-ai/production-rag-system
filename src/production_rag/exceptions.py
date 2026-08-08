@@ -1,4 +1,9 @@
+from typing import TYPE_CHECKING
+
 from fastapi import status
+
+if TYPE_CHECKING:  # pragma: no cover - import cycle exists only for type checkers
+    from production_rag.ingestion.quality import ExtractionReport
 
 
 class PaddingtonError(Exception):
@@ -41,6 +46,23 @@ class InvalidSourceURIError(ValidationError):
     A subclass of ValidationError (422): the caller sent something we cannot
     parse, which is a request defect rather than an upstream failure.
     """
+
+
+class LowTextYieldError(ValidationError):
+    """A document parsed successfully but produced too little text to be real.
+
+    A subclass of ValidationError (422) rather than a 5xx: nothing malfunctioned.
+    The file was read, the parser ran, and the answer is that this file does not
+    contain extractable text — which is a fact about the upload, so it belongs
+    with the caller.
+
+    Carries the ``ExtractionReport`` that justified the rejection so a failure
+    record can store the measurements without re-deriving them from the message.
+    """
+
+    def __init__(self, detail: str, report: "ExtractionReport") -> None:
+        super().__init__(detail)
+        self.report = report
 
 
 class SourceFetchError(PaddingtonError):

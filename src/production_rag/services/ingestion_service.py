@@ -19,6 +19,7 @@ boundaries: with a job, each batch commits (progress must be observable while
 in flight); without one, the caller owns the transaction.
 """
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -28,10 +29,12 @@ from sqlalchemy.exc import IntegrityError
 from production_rag.config import Settings
 from production_rag.exceptions import ValidationError
 from production_rag.ingestion.connectors import fetch_source
+from production_rag.ingestion.extraction import extract_segments
 from production_rag.ingestion.idempotency import content_hash
-from production_rag.ingestion.loaders import ExtractedSegment, load_file, resolve_mime
+from production_rag.ingestion.loaders import ExtractedSegment, resolve_mime
 from production_rag.ingestion.metadata import METADATA_VERSION, extract_metadata
 from production_rag.ingestion.normalize import NORMALIZER_VERSION
+from production_rag.ingestion.quality import METHOD_STORED_BODY, ExtractionReport
 from production_rag.ingestion.sources import parse_source_uri
 from production_rag.llm.client import count_tokens
 from production_rag.llm.embedding_service import EmbeddingService
@@ -50,6 +53,23 @@ from production_rag.services.document_service import (
 logger = get_logger(__name__)
 
 DEFAULT_BATCH_SIZE = 100
+
+
+@dataclass(frozen=True, slots=True)
+class MaterializedSource:
+    """A document's bytes, resolved into segments and the facts about that.
+
+    ``filename``/``content_type`` are carried because for a URI source both are
+    discovered by the fetch and are not knowable when the job is created; the
+    ``report`` is carried because how the text was obtained (local parser, OCR,
+    the stored body) outlives the decision to accept it — it is stored on the
+    document and on any failure record.
+    """
+
+    segments: list[ExtractedSegment]
+    filename: str | None
+    content_type: str | None
+    report: ExtractionReport
 
 
 class IngestionService:
@@ -103,17 +123,18 @@ class IngestionService:
             )
             await self._jobs.reset_progress(job)
 
-        segments, filename, content_type = await self._materialize(job, settings)
+        materialized = await self._materialize(job, settings)
 
         return await self._persist(
             # The caller's title wins; otherwise derive it from the filename the
             # fetch actually resolved, which for a URI source is only known now.
-            title=job.title or _fallback_title(filename, job.source),
-            segments=segments,
+            title=job.title or _fallback_title(materialized.filename, job.source),
+            segments=materialized.segments,
             user_id=job.user_id,
             source=job.source,
             job=job,
-            mime_type=resolve_mime(filename, content_type),
+            mime_type=resolve_mime(materialized.filename, materialized.content_type),
+            extraction_method=materialized.report.method,
         )
 
     async def ingest_now(
@@ -141,7 +162,7 @@ class IngestionService:
 
     async def _materialize(
         self, job: IngestionJob, settings: Settings
-    ) -> tuple[list[ExtractedSegment], str | None, str | None]:
+    ) -> MaterializedSource:
         """Get the document's bytes and parse them into segments.
 
         Uploads carry their bytes on the job row (the worker cannot read the
@@ -185,11 +206,17 @@ class IngestionService:
             else:
                 return await self._segments_from_stored_body(job)
 
-        return load_file(content, filename, content_type), filename, content_type
+        # Parsing is a policy, not a function call: local parser first, quality
+        # gate, then OCR only if the gate says the local answer is not real.
+        result = await extract_segments(content, filename, content_type, settings)
+        return MaterializedSource(
+            segments=result.segments,
+            filename=filename,
+            content_type=content_type,
+            report=result.report,
+        )
 
-    async def _segments_from_stored_body(
-        self, job: IngestionJob
-    ) -> tuple[list[ExtractedSegment], str | None, str | None]:
+    async def _segments_from_stored_body(self, job: IngestionJob) -> MaterializedSource:
         """Rebuild segments from the persisted document body (re-index only).
 
         The body survives as ``Document.content``, so a document can be
@@ -223,7 +250,20 @@ class IngestionService:
                 else "document had no page/section provenance to lose"
             ),
         )
-        return [ExtractedSegment(text=existing.content)], existing.title, None
+        segments = [ExtractedSegment(text=existing.content)]
+        # No quality gate here, deliberately: this text already passed one when
+        # it was first ingested, and there are no bytes and no page count left to
+        # judge it by. Re-gating would only be able to guess.
+        return MaterializedSource(
+            segments=segments,
+            filename=existing.title,
+            content_type=None,
+            report=ExtractionReport(
+                method=METHOD_STORED_BODY,
+                char_count=len(existing.content),
+                segment_count=len(segments),
+            ),
+        )
 
     async def _persist(
         self,
@@ -233,6 +273,7 @@ class IngestionService:
         source: str,
         job: IngestionJob | None,
         mime_type: str | None = None,
+        extraction_method: str | None = None,
     ) -> Document | None:
         full_content, chunks = build_chunks(segments)
         if not chunks:
@@ -282,7 +323,12 @@ class IngestionService:
             # metadata value looks like an error.
             if existing.doc_metadata.get("extractor_version") != METADATA_VERSION:
                 await self._documents.refresh_metadata(
-                    existing, extract_metadata(full_content, mime_type=mime_type)
+                    existing,
+                    extract_metadata(
+                        full_content,
+                        mime_type=mime_type,
+                        extraction_method=extraction_method,
+                    ),
                 )
                 # Cached answers were computed against the old metadata, so the
                 # filters that produced them may no longer select the same chunks.
@@ -316,7 +362,9 @@ class IngestionService:
         # Extracted from the *normalized* body, so the extractor reads the same
         # string the embedding model does rather than the loader's ligatures and
         # stray whitespace.
-        metadata = extract_metadata(full_content, mime_type=mime_type)
+        metadata = extract_metadata(
+            full_content, mime_type=mime_type, extraction_method=extraction_method
+        )
 
         document = await self._upsert_document(
             existing=existing,

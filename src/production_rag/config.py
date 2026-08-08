@@ -177,6 +177,120 @@ class Settings(BaseSettings):
         """
         return resolve_config_path(value)
 
+    # Ingestion quality gates
+    ingestion_min_chars_per_page: int = Field(
+        default=50,
+        description="Minimum characters extracted per PDF page before the "
+        "document is rejected as scanned or image-only. A page of prose runs "
+        "1,500-3,000 characters, so this sits far below any text PDF and far "
+        "above the artefacts a scanner leaves (a page number, a header stamp). "
+        "Applies to PDFs only — other formats have no pages to divide by.",
+    )
+
+    # Document AI OCR (fallback extractor). See docs/document-ai-setup.md for the
+    # project/processor/IAM steps these values come from.
+    ocr_enabled: bool = Field(
+        default=False,
+        description="Enable the Document AI fallback for scanned PDFs and for "
+        "formats with no local parser (XLSX, XLSM, PPTX). Off by default: it "
+        "bills per page and requires a Google Cloud processor.",
+    )
+    documentai_project_id: str = Field(
+        default="", description="Google Cloud project owning the Document AI processor"
+    )
+    documentai_location: str = Field(
+        default="us",
+        description="Document AI processor region ('us' or 'eu'). Baked into the "
+        "API endpoint and into the processor's resource name, so it cannot be "
+        "changed without creating a new processor.",
+    )
+    documentai_processor_id: str = Field(
+        default="", description="Layout Parser processor id (the hex tail of its resource name)"
+    )
+    documentai_processor_version: str = Field(
+        default="pretrained-layout-parser-v1.0-2024-06-03",
+        description="Pinned processor version. Pinned rather than defaulted "
+        "because extraction output is an input to stored embeddings: letting "
+        "Google move the model underneath us would silently change what a "
+        "re-ingest produces, with nothing downstream able to detect it.",
+    )
+    documentai_service_account_file: str = Field(
+        default="",
+        description="Service-account JSON key with roles/documentai.apiUser. "
+        "Falls back to GOOGLE_SERVICE_ACCOUNT_FILE when empty, since one key "
+        "usually serves both Drive and Document AI in the same project.",
+    )
+    documentai_max_pages: int = Field(
+        default=500,
+        description="Refuse to OCR a document with more pages than this, before "
+        "the first API call. A cost guard, not a technical limit: at ~$10 per "
+        "1,000 pages an unbounded scan is billed per attempt, and retries are "
+        "automatic.",
+    )
+    documentai_max_concurrency: int = Field(
+        default=4,
+        description="Concurrent Document AI requests per document. The online "
+        "quota is 120 requests/minute per processor; four in flight at ~5-10s "
+        "each stays well inside it while keeping a 500-page scan tolerable.",
+    )
+    documentai_batch_threshold_pages: int = Field(
+        default=60,
+        description="Above this page count, use batch processing via Cloud "
+        "Storage instead of sharded online calls. Online is capped at 15 pages "
+        "per request, so a large document otherwise becomes dozens of round "
+        "trips; batch takes one, at the cost of a bucket round trip.",
+    )
+    documentai_gcs_bucket: str = Field(
+        default="",
+        description="Bucket for Document AI batch input/output. Required only "
+        "for documents past DOCUMENTAI_BATCH_THRESHOLD_PAGES; objects are "
+        "deleted after each job, so a short lifecycle rule is a backstop, not "
+        "the cleanup mechanism.",
+    )
+    documentai_gcs_prefix: str = Field(
+        default="docai",
+        description="Object-name prefix inside the batch bucket, so Document AI "
+        "staging is distinguishable from anything else sharing it.",
+    )
+    documentai_batch_timeout_seconds: int = Field(
+        default=900,
+        description="Maximum wait for a batch operation to finish. Must stay "
+        "below INGESTION_JOB_TIMEOUT_SECONDS, or the worker kills the job while "
+        "Google is still working and the retry starts over.",
+    )
+
+    @field_validator("documentai_service_account_file")
+    @classmethod
+    def _resolve_documentai_credentials_path(cls, value: str) -> str:
+        """Normalize to an absolute path at load time, as for the Drive key."""
+        return resolve_config_path(value)
+
+    @property
+    def documentai_credentials_path(self) -> str:
+        """The service-account key Document AI should use.
+
+        Falls back to the Drive key: the common deployment has one project and
+        one service account, and requiring the same path twice in ``.env`` is a
+        way to get them out of sync.
+        """
+        return self.documentai_service_account_file or self.google_service_account_file
+
+    @property
+    def ocr_available(self) -> bool:
+        """Whether an OCR call could actually be made right now.
+
+        Checked at the *endpoint* as well as at the extractor, so an upload of a
+        spreadsheet is a 415 with an actionable message on a deployment without
+        credentials, rather than a 202 followed by a job that fails a second
+        later saying the same thing.
+        """
+        return bool(
+            self.ocr_enabled
+            and self.documentai_project_id
+            and self.documentai_processor_id
+            and self.documentai_credentials_path
+        )
+
     # Ingestion / retrieval
     embedding_model: str = Field(
         default="text-embedding-3-small",

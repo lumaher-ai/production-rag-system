@@ -32,6 +32,23 @@ MAX_SECTION_LEN = 255
 _HEADING_RE = re.compile(r"^#{1,6}[ \t]+(.+?)[ \t]*#*[ \t]*$")
 
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+XLSM_MIME = "application/vnd.ms-excel.sheet.macroenabled.12"
+PPTX_MIME = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+
+# Formats this process cannot parse itself — there is no loader in the registry
+# below for them, and a remote extractor (Document AI) is the only way in. Kept
+# separate from the registry rather than faked into it: every loader here is
+# synchronous and free, and a network call that bills per page is neither.
+DOCAI_ONLY_MIMES: frozenset[str] = frozenset({XLSX_MIME, XLSM_MIME, PPTX_MIME})
+
+# Everything the remote extractor can read. Wider than DOCAI_ONLY_MIMES: a PDF
+# has a local loader *and* an OCR fallback for when that loader comes back
+# empty. Images are absent deliberately — Document AI reads them, but this
+# system has no notion of a document that is one picture.
+OCR_CAPABLE_MIMES: frozenset[str] = DOCAI_ONLY_MIMES | frozenset(
+    {"application/pdf", DOCX_MIME, "text/html"}
+)
 
 
 class ExtractedSegment(BaseModel):
@@ -159,7 +176,15 @@ EXTENSION_TO_MIME: dict[str, str] = {
     ".txt": "text/plain",
     ".md": "text/markdown",
     ".markdown": "text/markdown",
+    # No loader below; reachable only through Document AI.
+    ".xlsx": XLSX_MIME,
+    ".xlsm": XLSM_MIME,
+    ".pptx": PPTX_MIME,
 }
+
+# What the 415 message offers, split by what it costs to support.
+SUPPORTED_FORMATS = "PDF, DOCX, HTML, TXT, Markdown"
+OCR_ONLY_FORMATS = "XLSX, XLSM, PPTX"
 
 
 def resolve_mime(filename: str | None, content_type: str | None) -> str | None:
@@ -193,21 +218,58 @@ def resolve_loader(filename: str | None, content_type: str | None) -> FileLoader
     return LOADER_REGISTRY.get(mime) if mime is not None else None
 
 
+def is_ingestible(
+    filename: str | None,
+    content_type: str | None,
+    *,
+    ocr_available: bool,
+) -> bool:
+    """Whether this system can ingest the file at all, right now.
+
+    Wider than ``resolve_loader``: a spreadsheet has no local loader but is
+    ingestible when Document AI is configured. Answering that here rather than
+    at the endpoint keeps the "what can we read" question in one module, and
+    makes it depend on *deployment* state — the same upload is a 202 on a
+    deployment with OCR credentials and a 415 on one without.
+    """
+    mime = resolve_mime(filename, content_type)
+    if mime is None:
+        return False
+    if mime in LOADER_REGISTRY:
+        return True
+    return ocr_available and mime in DOCAI_ONLY_MIMES
+
+
+def unsupported_type_message(filename: str | None, *, ocr_available: bool) -> str:
+    """The 415 body: what is supported, and what would make more supported."""
+    base = f"Unsupported file type for '{filename}'. Supported: {SUPPORTED_FORMATS}"
+    if ocr_available:
+        return f"{base}, {OCR_ONLY_FORMATS}."
+    return (
+        f"{base}. {OCR_ONLY_FORMATS} require Document AI OCR — set OCR_ENABLED=true "
+        f"and DOCUMENTAI_PROCESSOR_ID to enable them."
+    )
+
+
 def load_file(
     content: bytes,
     filename: str | None,
     content_type: str | None,
 ) -> list[ExtractedSegment]:
-    """Dispatch to the right loader and return non-empty text segments.
+    """Dispatch to the right *local* loader and return non-empty text segments.
 
     Raises ``UnsupportedFileTypeError`` (415) for unknown formats and
     ``ValidationError`` (422) when nothing extractable is found.
+
+    Local only, by design: this is the free, synchronous, deterministic path.
+    Formats that need a remote extractor are routed by ``ingestion.extraction``,
+    which calls this first and falls back only when it has to.
     """
     loader = resolve_loader(filename, content_type)
     if loader is None:
         logger.warning("upload_unsupported_type", filename=filename, content_type=content_type)
         raise UnsupportedFileTypeError(
-            f"Unsupported file type for '{filename}'. Supported: PDF, DOCX, HTML, TXT, Markdown."
+            unsupported_type_message(filename, ocr_available=False)
         )
 
     segments = [seg for seg in loader.extract(content, filename or "") if seg.text.strip()]

@@ -55,7 +55,12 @@ DetectorFactory.seed = 0
 
 # Bump on ANY change to the rules below — the marker tables, the date patterns,
 # the thresholds, or the shape of the returned document.
-METADATA_VERSION = "extractive-v1"
+#
+# v2 added ``extraction_method``. Documents ingested under v1 have no such key,
+# and the refresh path in IngestionService._persist backfills it on their next
+# ingest — which is the whole reason this version is not part of the idempotency
+# gate: adding a key must not force a corpus-wide re-embed.
+METADATA_VERSION = "extractive-v2"
 
 # Extractors read a bounded prefix, not the whole document. A 200-page PDF and a
 # one-page memo should cost the same to classify, and the signals these rules look
@@ -365,12 +370,23 @@ def detect_doc_type(text: str) -> str:
 # ─── Assembly ───
 
 
-def extract_metadata(text: str, *, mime_type: str | None = None) -> dict[str, Any]:
+def extract_metadata(
+    text: str,
+    *,
+    mime_type: str | None = None,
+    extraction_method: str | None = None,
+) -> dict[str, Any]:
     """Build a document's metadata document from its normalized text.
 
-    Pure and deterministic: the same text and MIME always produce the same dict,
-    which is what lets a re-ingest be compared against what is stored rather than
-    blindly overwriting it.
+    Pure and deterministic: the same text, MIME and extraction method always
+    produce the same dict, which is what lets a re-ingest be compared against
+    what is stored rather than blindly overwriting it.
+
+    ``extraction_method`` is the one key here that is *not* derived from the
+    text — it is how the text was obtained (a local parser, Document AI, the
+    previously-stored body). It is stored anyway because OCR'd text is noisier
+    than parsed text in ways that matter downstream, and "which of my documents
+    came out of an OCR engine?" is otherwise unanswerable.
 
     Keys whose extractor returned ``None`` are **omitted**, never stored as
     ``null``. JSONB containment distinguishes the two — ``metadata @>
@@ -397,6 +413,9 @@ def extract_metadata(text: str, *, mime_type: str | None = None) -> dict[str, An
 
     if mime_type:
         metadata["mime_type"] = mime_type
+
+    if extraction_method:
+        metadata["extraction_method"] = extraction_method
 
     return metadata
 
