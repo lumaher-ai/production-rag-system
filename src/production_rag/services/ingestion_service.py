@@ -24,10 +24,12 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy.exc import IntegrityError
 
 from production_rag.config import Settings
 from production_rag.exceptions import ValidationError
+from production_rag.ingestion import quality
 from production_rag.ingestion.connectors import fetch_source
 from production_rag.ingestion.extraction import extract_segments
 from production_rag.ingestion.idempotency import content_hash
@@ -206,9 +208,40 @@ class IngestionService:
             else:
                 return await self._segments_from_stored_body(job)
 
+        mime_type = resolve_mime(filename, content_type)
+
+        # A previous attempt may already have paid for a remote extraction.
+        cached = _cached_extraction(job)
+        if cached is not None:
+            segments, method = cached
+            logger.info(
+                "ingestion_extraction_reused",
+                job_id=str(job.id),
+                method=method,
+                segments=len(segments),
+            )
+            return MaterializedSource(
+                segments=segments,
+                filename=filename,
+                content_type=content_type,
+                report=quality.assess(
+                    segments, content=content, mime_type=mime_type, method=method
+                ),
+            )
+
         # Parsing is a policy, not a function call: local parser first, quality
         # gate, then OCR only if the gate says the local answer is not real.
         result = await extract_segments(content, filename, content_type, settings)
+
+        if result.used_ocr and self._jobs is not None:
+            # Only the remote path is cached. Local parsing is free and
+            # deterministic, so storing it would buy nothing and cost a column.
+            await self._jobs.set_extraction(
+                job,
+                result.report.method,
+                [segment.model_dump() for segment in result.segments],
+            )
+
         return MaterializedSource(
             segments=result.segments,
             filename=filename,
@@ -520,6 +553,29 @@ class IngestionService:
                     processed_chunks=processed,
                     total_chunks=total,
                 )
+
+
+def _cached_extraction(
+    job: IngestionJob,
+) -> tuple[list[ExtractedSegment], str] | None:
+    """Rehydrate a previous attempt's remote extraction, if it stored one.
+
+    Returns ``None`` on anything unexpected rather than raising. This is a
+    cache: a row written by an older version of the envelope should cost one
+    re-extraction, not a permanently unprocessable document.
+    """
+    envelope = job.extracted_segments
+    if not envelope:
+        return None
+    method = envelope.get("method")
+    raw = envelope.get("segments")
+    if not method or not isinstance(raw, list):
+        return None
+    try:
+        return [ExtractedSegment.model_validate(item) for item in raw], str(method)
+    except PydanticValidationError:
+        logger.warning("ingestion_extraction_cache_unreadable", job_id=str(job.id))
+        return None
 
 
 def _fallback_title(filename: str | None, source: str) -> str:

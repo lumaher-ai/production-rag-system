@@ -1,10 +1,12 @@
 from datetime import UTC, datetime
+from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import DateTime, ForeignKey, Integer, LargeBinary, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from production_rag.database import Base
+from production_rag.models.document import MetadataJSON
 from production_rag.models.enums import JobStatus
 
 
@@ -54,6 +56,24 @@ class IngestionJob(Base):
     # other way to recover them for staged bytes.
     filename: Mapped[str | None] = mapped_column(String(512), nullable=True)
     content_type: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Cached output of a *remote* extraction: {"method": ..., "segments": [...]}.
+    # Populated only on the Document AI path, and there for two reasons.
+    #
+    # Correctness: the resume cursor is only meaningful because re-deriving the
+    # chunk list produces the identical list. Local parsing is deterministic and
+    # gives that for free; a call to a remote, versioned service does not, and a
+    # drifted re-extraction would splice two different parses into one document
+    # with nothing downstream able to notice. Caching makes the guarantee local.
+    #
+    # Cost: retries are automatic and OCR bills per page, so without this a
+    # 400-page scan that fails while embedding is billed for OCR three times.
+    #
+    # Cleared with `payload` on success. Deliberately *not* cleared by
+    # `reset_progress` — extraction does not depend on the normalizer or chunker,
+    # so a version change invalidates the cursor and not this.
+    extracted_segments: Mapped[dict[str, Any] | None] = mapped_column(
+        MetadataJSON, nullable=True
+    )
 
     # ─── Progress ───
     # Known only after parsing and chunking, hence nullable.

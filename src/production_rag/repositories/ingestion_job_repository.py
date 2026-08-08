@@ -1,4 +1,5 @@
 from datetime import UTC, datetime, timedelta
+from typing import Any
 from uuid import UUID
 
 from sqlalchemy import or_, select
@@ -157,6 +158,20 @@ class IngestionJobRepository:
         await self._session.commit()
         return job
 
+    async def set_extraction(
+        self, job: IngestionJob, method: str, segments: list[dict[str, Any]]
+    ) -> IngestionJob:
+        """Cache a remote extraction so a retry reuses it instead of re-buying it.
+
+        Committed on its own, immediately after the extraction returns and
+        before any of the work that might fail — which is the whole point. A
+        cache written at the end of a successful job would only ever be
+        populated for jobs that did not need it.
+        """
+        job.extracted_segments = {"method": method, "segments": segments}
+        await self._session.commit()
+        return job
+
     async def reset_progress(self, job: IngestionJob) -> IngestionJob:
         """Rewind the resume cursor to zero (chunker changed between attempts)."""
         job.processed_chunks = 0
@@ -177,14 +192,17 @@ class IngestionJobRepository:
         return job
 
     async def mark_succeeded(self, job: IngestionJob, document_id: UUID) -> IngestionJob:
-        """Finish the job and release its staged payload.
+        """Finish the job and release everything it was holding for a retry.
 
         Dropping ``payload`` here is what keeps 100 MiB uploads from
-        accumulating; it is safe only once the document is fully written.
+        accumulating, and ``extracted_segments`` is the same bargain in smaller
+        units — both exist only to make a *retry* cheap, and it is safe to drop
+        them once the document is fully written.
         """
         job.status = JobStatus.SUCCEEDED.value
         job.document_id = document_id
         job.payload = None
+        job.extracted_segments = None
         job.error = None
         job.failure_reason = None
         job.finished_at = datetime.now(UTC)
