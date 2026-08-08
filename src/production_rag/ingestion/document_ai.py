@@ -292,24 +292,33 @@ class DocumentAIExtractor:
         )
 
     async def _get_client(self) -> Any:
+        """Build the client once, splitting the blocking half from the bound half.
+
+        The key file is read in a worker thread — it is blocking I/O and has no
+        business on the event loop. The client itself is then constructed *here*,
+        on the loop, and that split is load-bearing rather than tidy:
+        ``grpc.aio`` binds its channel to the running event loop at construction
+        time, so building the whole client inside ``to_thread`` raises
+        "There is no current event loop in thread 'asyncio_0'" before a single
+        request is sent.
+        """
         if self._client is None:
-            self._client = await asyncio.to_thread(_build_client, self._settings)
+            credentials = await asyncio.to_thread(_load_credentials, self._settings)
+            self._client = _build_client(self._settings, credentials)
         return self._client
 
 
-# ─── Client construction (synchronous, run in a thread) ───
+# ─── Client construction ───
 
 
-def _build_client(settings: Settings) -> Any:
-    """Build the async client with explicit service-account credentials.
+def _load_credentials(settings: Settings) -> Any:
+    """Read the service-account key. Blocking; call from a thread.
 
-    Explicit rather than Application Default Credentials, matching the Drive
-    connector: this system's Google access is always a key file named in
-    configuration, so a misconfigured deployment fails with "that path does not
-    exist" instead of silently picking up whatever identity the host happens to
-    carry.
-
-    Runs in a thread because reading and parsing the key file is blocking I/O.
+    Explicit credentials rather than Application Default Credentials, matching
+    the Drive connector: this system's Google access is always a key file named
+    in configuration, so a misconfigured deployment fails with "that path does
+    not exist" instead of silently picking up whatever identity the host happens
+    to carry.
     """
     from google.oauth2 import service_account
 
@@ -327,7 +336,7 @@ def _build_client(settings: Settings) -> Any:
         )
 
     try:
-        credentials = service_account.Credentials.from_service_account_file(
+        return service_account.Credentials.from_service_account_file(
             path, scopes=[CLOUD_PLATFORM_SCOPE]
         )
     except (OSError, ValueError) as exc:
@@ -335,6 +344,9 @@ def _build_client(settings: Settings) -> Any:
             f"Could not read the Document AI service-account key at '{path}': {exc}"
         ) from exc
 
+
+def _build_client(settings: Settings, credentials: Any) -> Any:
+    """Construct the async client. **Must run on the event loop** — see ``_get_client``."""
     # The regional endpoint is mandatory. A processor lives in one location, and
     # the global default endpoint answers requests for it with a confusing
     # not-found rather than a redirect.
@@ -557,7 +569,16 @@ class _WalkState:
 
 def _walk(block: Any, state: _WalkState, segments: list[ExtractedSegment]) -> None:
     page = _page_of(block, state.page_offset)
-    if page is not None and state.page is None:
+
+    # A page boundary closes the current segment, exactly as a heading does.
+    # Without this, a run of paragraphs spanning pages 1-3 becomes one segment
+    # tagged with page 1, every chunk built from it inherits that number, and the
+    # citation for text on page 3 points at page 1. PdfLoader gets this right for
+    # free by emitting one segment per page; this walker has to do it explicitly,
+    # and the failure is silent — the text is correct, only the provenance lies.
+    if page is not None and state.page is not None and page != state.page:
+        state.flush(segments)
+    if page is not None:
         state.page = page
 
     text_block = block.text_block

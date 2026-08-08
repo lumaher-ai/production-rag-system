@@ -17,6 +17,8 @@ invoice. Both are asserted on call counts, not on outputs.
 
 import pytest
 from google.api_core import exceptions as gexc
+from google.auth.credentials import AnonymousCredentials
+from google.cloud import documentai
 
 from production_rag.config import get_settings
 from production_rag.exceptions import (
@@ -148,6 +150,51 @@ async def test_nested_blocks_are_walked() -> None:
 
     assert "Nested body text." in segments[0].text
     assert segments[0].section == "Outer"
+
+
+async def test_a_page_boundary_closes_a_segment() -> None:
+    """Found live: prose spanning pages became one segment tagged page 1.
+
+    The text was right and only the provenance lied, which is the worst shape
+    for a bug in a system whose answers cite page numbers. `PdfLoader` gets this
+    free by emitting one segment per page; this walker has to do it explicitly.
+    """
+    client = FakeDocumentAIClient(
+        document(
+            [
+                text_block("Opening paragraph.", page=1),
+                text_block("Continues here.", page=1),
+                text_block("Now on the second page.", page=2),
+                text_block("Still the second page.", page=2),
+            ]
+        )
+    )
+
+    segments = await _extractor(client).extract(b"x", "d.pdf", PDF_MIME)
+
+    assert [s.page for s in segments] == [1, 2]
+    assert "Opening paragraph." in segments[0].text
+    assert "Continues here." in segments[0].text
+    assert "Now on the second page." in segments[1].text
+    assert "Opening paragraph." not in segments[1].text
+
+
+async def test_a_section_spanning_pages_keeps_its_heading_on_both_halves() -> None:
+    """Page accuracy splits the segment; the section label must survive the split."""
+    client = FakeDocumentAIClient(
+        document(
+            [
+                text_block("Termination", "heading-1", page=4),
+                text_block("Either party may terminate.", page=4),
+                text_block("Notice must be in writing.", page=5),
+            ]
+        )
+    )
+
+    segments = await _extractor(client).extract(b"x", "d.pdf", PDF_MIME)
+
+    assert [s.page for s in segments] == [4, 5]
+    assert [s.section for s in segments] == ["Termination", "Termination"]
 
 
 async def test_an_empty_layout_yields_no_segments() -> None:
@@ -287,10 +334,38 @@ def test_missing_credentials_are_a_configuration_error_not_a_crash() -> None:
                 "google_service_account_file": ""}
     )
     with pytest.raises(ConnectorNotConfiguredError) as excinfo:
-        document_ai._build_client(settings)
+        document_ai._load_credentials(settings)
 
     assert "SERVICE_ACCOUNT_FILE" in excinfo.value.detail
     assert excinfo.value.status_code == 503
+
+
+async def test_a_real_client_can_be_constructed_from_inside_the_event_loop(
+    monkeypatch,
+) -> None:
+    """Regression: the client must be built on the loop, not in a worker thread.
+
+    `grpc.aio` binds its channel to the running event loop at construction time.
+    Building the whole client inside `asyncio.to_thread` — which is tempting,
+    because reading the key file is blocking I/O — raises "There is no current
+    event loop in thread 'asyncio_0'" before a single request goes out.
+
+    Every other test here injects a fake client and so never exercises this
+    path; this one builds the genuine `DocumentProcessorServiceAsyncClient` with
+    fake credentials. No network: constructing a channel does not connect.
+    """
+    monkeypatch.setattr(
+        document_ai, "_load_credentials", lambda _s: AnonymousCredentials()
+    )
+
+    extractor = DocumentAIExtractor(_configured())
+    client = await extractor._get_client()
+
+    assert isinstance(client, documentai.DocumentProcessorServiceAsyncClient)
+    # And the pinned name resolves off the real client, not a stub's static method.
+    assert extractor._processor_name().endswith(
+        f"/processorVersions/{get_settings().documentai_processor_version}"
+    )
 
 
 def test_the_extractor_advertises_its_mapping_version() -> None:
@@ -329,11 +404,7 @@ def test_the_regional_endpoint_is_used(monkeypatch) -> None:
     monkeypatch.setattr(
         document_ai.documentai, "DocumentProcessorServiceAsyncClient", _fake_async_client
     )
-    import google.oauth2.service_account as sa
 
-    monkeypatch.setattr(sa.Credentials, "from_service_account_file",
-                        _Credentials.from_service_account_file)
-
-    document_ai._build_client(_configured(documentai_location="eu"))
+    document_ai._build_client(_configured(documentai_location="eu"), _Credentials())
 
     assert captured["endpoint"] == "eu-documentai.googleapis.com"
