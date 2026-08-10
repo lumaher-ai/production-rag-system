@@ -25,6 +25,7 @@ from production_rag.repositories.failed_ingestion_repository import (
 )
 from production_rag.repositories.ingestion_job_repository import IngestionJobRepository
 from production_rag.schemas.document import (
+    DocumentDeletedResponse,
     DocumentResponse,
     IngestFromUriRequest,
     QueryRequest,
@@ -233,3 +234,35 @@ async def list_documents(
 ) -> list[DocumentResponse]:
     documents = await service.list_user_documents(user_id=current_user.id)
     return [DocumentResponse.model_validate(doc) for doc in documents]
+
+
+@router.delete("/{document_id}", response_model=DocumentDeletedResponse)
+async def delete_document(
+    document_id: UUID,
+    current_user: User = Depends(get_current_user),
+    service: DocumentService = Depends(get_document_service),
+) -> DocumentDeletedResponse:
+    """Delete a document, its chunks, and every reference to it.
+
+    Scoped to its owner: another user's document id is a **404**, not a 403, so
+    the endpoint never confirms that an id exists.
+
+    Returns **200 with a receipt** rather than a bare 204. The interesting fact
+    about this operation is how much it removed — ``chunks_deleted`` is the
+    count of vectors that left the index, which is the difference between "the
+    row is gone" and "the document can no longer be retrieved or cited". A 204
+    would make the caller run a query to find that out.
+
+    Whether the id existed *before* this call is not distinguishable from the
+    response: a second delete of the same id is a 404. Deleting is not idempotent
+    in that sense, which is the standard trade for not leaking id existence.
+    """
+    deleted = await service.delete_document(
+        document_id=document_id, user_id=current_user.id
+    )
+    return DocumentDeletedResponse(
+        id=deleted.id,
+        title=deleted.title,
+        source=deleted.source,
+        chunks_deleted=deleted.chunks_deleted,
+    )

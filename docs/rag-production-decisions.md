@@ -874,7 +874,7 @@ paid for on every write.
 - **Options:** (a) hand-curated Q/A + gold chunk ids; (b) LLM-generated from your own corpus
   (question ← chunk, so the gold context is known by construction); (c) public benchmark;
   (d) production query logs, once they exist.
-- **Call:** **(b) seeded, then (a) hand-audited** — generate ~150–200 Q/A/context triples from
+- **Call:** **(b) seeded, then (a) hand-audited** — generate 150 Q/A/context triples from
   documents you actually ingest, then review them by hand and discard the bad ones. Deliberately
   stratify by query type: **paraphrase, exact-term, multi-hop, and unanswerable.** The unanswerable
   slice is the one most systems omit and the one that measures E6/F2 — without it you cannot

@@ -32,6 +32,30 @@ class DocumentResponse(BaseModel):
     model_config = {"from_attributes": True, "populate_by_name": True}
 
 
+class DocumentDeletedResponse(BaseModel):
+    """Receipt for a delete — what was removed, not just that something was.
+
+    ``chunks_deleted`` is the count the DELETE reported, so it is also the
+    confirmation that the retrievable half of the document is gone. It can
+    differ from the document's stored ``chunk_count`` when an ingestion was
+    interrupted part-way, and the number here is the true one.
+    """
+
+    id: UUID
+    title: str
+    source: str
+    chunks_deleted: int = Field(
+        ...,
+        description="Chunk rows removed — the vectors retrieval was reading.",
+    )
+    cache_invalidated: bool = Field(
+        default=True,
+        description="Whether the owner's cached answers were dropped. Always true: "
+        "a cached answer embeds its source previews, so it would keep quoting the "
+        "deleted document without touching the vector index.",
+    )
+
+
 class IngestFromUriRequest(BaseModel):
     uri: str = Field(
         ...,

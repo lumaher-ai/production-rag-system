@@ -22,6 +22,7 @@ from production_rag.repositories.document_repository import (
     DEFAULT_ITERATIVE_SCAN,
     DocumentRepository,
 )
+from production_rag.repositories.ingestion_job_repository import IngestionJobRepository
 from production_rag.repositories.query_cache_repository import QueryCacheRepository
 from production_rag.schemas.document import ChunkSource, QueryResponse
 
@@ -43,6 +44,21 @@ class PreparedChunk:
     char_end: int | None
     page: int | None
     section: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class DeletedDocument:
+    """What a delete actually removed, captured before the rows are gone.
+
+    ``chunks_deleted`` is counted from the DELETE, not read from
+    ``Document.chunk_count``: an ingestion interrupted part-way leaves those two
+    disagreeing, and the honest number is the one the statement returned.
+    """
+
+    id: UUID
+    title: str
+    source: str
+    chunks_deleted: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,6 +178,7 @@ class DocumentService:
         embedding_service: EmbeddingService,
         llm_client: LLMClient,
         query_cache_repository: QueryCacheRepository,
+        job_repository: IngestionJobRepository | None = None,
         query_cache_ttl_seconds: int = 3600,
         hnsw_ef_search: int = DEFAULT_EF_SEARCH,
         hnsw_iterative_scan: str = DEFAULT_ITERATIVE_SCAN,
@@ -170,6 +187,12 @@ class DocumentService:
         self._embedding_service = embedding_service
         self._llm = llm_client
         self._query_cache = query_cache_repository
+        # Only ``delete_document`` needs it, so retrieval-only callers (the agent
+        # tools, eval harnesses) are not made to construct one. Deleting without
+        # it raises rather than silently skipping the job detach — a delete that
+        # quietly left dangling references would be the exact bug this argument
+        # exists to prevent.
+        self._jobs = job_repository
         self._query_cache_ttl_seconds = query_cache_ttl_seconds
         self._hnsw_ef_search = hnsw_ef_search
         self._hnsw_iterative_scan = hnsw_iterative_scan
@@ -348,3 +371,69 @@ class DocumentService:
 
     async def list_user_documents(self, user_id: UUID) -> list[Document]:
         return await self._repository.list_documents_by_user(user_id)
+
+    async def delete_document(self, document_id: UUID, user_id: UUID) -> DeletedDocument:
+        """Remove a document and everything that points at it.
+
+        Four things reference a document, and a delete that skips any of them
+        leaves the system answering questions from a document the user believes
+        is gone:
+
+        1. **its chunks** — deleted. These are what retrieval actually reads, so
+           they are the deletion. A chunk carries its own ``owner_id``,
+           ``document_title`` and metadata (denormalized for the ANN query), so
+           an orphaned chunk is fully self-sufficient and would keep being
+           retrieved and cited forever.
+        2. **ingestion jobs** — their ``document_id`` is nulled, not deleted.
+           The job row is the record that this source was ingested, when, and at
+           what cost; erasing it would destroy the audit trail to tidy up a
+           pointer. This matches the ``ON DELETE SET NULL`` on the column.
+        3. **cached answers** — the owner's query cache is dropped. An entry
+           holds a fully-rendered answer with its source previews baked in, so a
+           cached hit would keep quoting the deleted document with no vector
+           search involved and nothing to notice the rows are gone. Same
+           invalidation ingestion performs, for the same reason.
+        4. **dead-letter failures** — untouched, deliberately. They reference a
+           *job*, never a document, and denormalize their own source string
+           precisely so they survive it.
+
+        Ownership is checked by fetching the row scoped to ``user_id``, so
+        another tenant's id is a 404.
+
+        **Known limit:** this does not cancel an ingestion job that is running
+        right now for the same document. A worker mid-flight will fail on its
+        next batch (its foreign key no longer resolves) and land in the
+        dead-letter table — recoverable and visible, but noisier than a real
+        cancellation. Cancellation needs a signal the worker polls, which does
+        not exist yet.
+        """
+        if self._jobs is None:
+            raise RuntimeError(
+                "DocumentService was constructed without a job repository, so it "
+                "cannot detach ingestion jobs from a deleted document."
+            )
+
+        document = await self._repository.get_document_for_owner(document_id, user_id)
+        # Read what the response needs before the row is deleted.
+        summary_title, summary_source = document.title, document.source
+
+        # Jobs first: the pointer has to go before the row it points at.
+        jobs_detached = await self._jobs.detach_document(document_id)
+        chunks_deleted = await self._repository.delete_document(document)
+        await self._query_cache.delete_by_user(user_id)
+
+        logger.info(
+            "document_deleted",
+            document_id=str(document_id),
+            user_id=str(user_id),
+            title=summary_title,
+            source=summary_source,
+            chunks_deleted=chunks_deleted,
+            jobs_detached=jobs_detached,
+        )
+        return DeletedDocument(
+            id=document_id,
+            title=summary_title,
+            source=summary_source,
+            chunks_deleted=chunks_deleted,
+        )

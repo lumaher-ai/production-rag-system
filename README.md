@@ -269,6 +269,35 @@ by non-matching ones. A flat map of scalars; nested objects and arrays are rejec
 }
 ```
 
+**Pull from Google Drive**
+
+`gdrive://<file_id>` — the id, **not** the browser URL. Pasting a
+`https://drive.google.com/...` link ingests whatever that URL serves to an anonymous
+client, which for anything non-public is the Google sign-in page: the ingest succeeds, and
+the document's content is the sign-in form.
+
+```bash
+curl -X POST http://127.0.0.1:8000/documents/ingest \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"uri": "gdrive://1A2b3C4d5E6f7G8h9I"}'
+```
+
+Where the id lives in a Drive URL, by kind:
+
+| Drive URL | File id |
+|---|---|
+| `docs.google.com/document/d/`**`1AbC…xYz`**`/edit` | between `/d/` and `/edit` |
+| `docs.google.com/spreadsheets/d/`**`1AbC…xYz`**`/edit#gid=0` | same |
+| `drive.google.com/file/d/`**`1AbC…xYz`**`/view?usp=sharing` | same |
+| `drive.google.com/open?id=`**`1AbC…xYz`** | the `id` query parameter |
+| `drive.google.com/drive/folders/1W7l…` | **a folder — no file id.** Open a file inside it |
+
+Two things must be true or the fetch fails loudly (502/503 rather than a junk document):
+`GOOGLE_SERVICE_ACCOUNT_FILE` points at a service-account key, and the file is shared with
+that service account's email — credentials are app-level, so the system reaches only what
+the *server* can see, never what your browser session can. Google Docs and Slides are
+exported (to HTML and text); Sheets and Forms have no supported text export and are a 422.
+
 **List your documents**
 
 ```bash
@@ -287,6 +316,24 @@ absent rather than `null` — these are the keys the query `filters` accept:
   }
 }
 ```
+
+**Delete a document**
+
+```bash
+curl -X DELETE http://127.0.0.1:8000/documents/$DOC_ID -H "Authorization: Bearer $TOKEN"
+```
+
+```jsonc
+{ "id": "…", "title": "contrato", "source": "gdrive://1A2b…",
+  "chunks_deleted": 12, "cache_invalidated": true }
+```
+
+Removes the document *and everything that points at it*: its chunks (which is the actual
+deletion — a chunk carries its own `owner_id`, title and metadata, so an orphan would keep
+being retrieved and cited), and the owner's cached answers (a cache hit re-serves baked-in
+source previews without touching the index). Ingestion jobs keep their row but have their
+`document_id` nulled — the record that this source was once ingested outlives the document.
+Another user's document id is a **404**, not a 403.
 
 ---
 

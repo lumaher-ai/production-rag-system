@@ -1,8 +1,8 @@
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import or_, select
+from sqlalchemy import CursorResult, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from production_rag.exceptions import NotFoundError
@@ -247,3 +247,33 @@ class IngestionJobRepository:
         job.heartbeat_at = None
         await self._session.commit()
         return job
+
+    async def detach_document(self, document_id: UUID) -> int:
+        """Null out every job's pointer to a document about to be deleted.
+
+        The column is declared ``ON DELETE SET NULL`` precisely so that deleting
+        a document does not erase the record that it was once ingested. This
+        performs that SET NULL in application code for the same reason
+        ``delete_document`` deletes chunks by hand: the constraint is enforced by
+        Postgres and not by the SQLite engine the unit tests use, so leaving it
+        to the database would make the outcome engine-dependent.
+
+        **The one method here that does not commit.** Every other transition
+        commits immediately because a job in flight must be observable; this is
+        not a transition — it is one step of another aggregate's delete, and it
+        has to roll back with the rest of that delete if a later step fails.
+        Committing here would leave jobs detached from a document that still
+        exists.
+        """
+        # ``execute`` is typed as returning ``Result``, which has no rowcount;
+        # a DML statement always yields a ``CursorResult``, which does.
+        result = cast(
+            "CursorResult[Any]",
+            await self._session.execute(
+                update(IngestionJob)
+                .where(IngestionJob.document_id == document_id)
+                .values(document_id=None)
+            ),
+        )
+        await self._session.flush()
+        return result.rowcount or 0

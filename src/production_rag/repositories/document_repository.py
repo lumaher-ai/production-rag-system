@@ -1,8 +1,8 @@
 import json
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID
 
-from sqlalchemy import delete, or_, select, text, update
+from sqlalchemy import CursorResult, delete, or_, select, text, update
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
@@ -131,12 +131,23 @@ class DocumentRepository:
         )
         await self._session.flush()
 
-    async def delete_chunks_by_document_id(self, document_id: UUID) -> None:
-        """Delete all chunks belonging to a document (used before re-chunking)."""
-        await self._session.execute(
-            delete(DocumentChunk).where(DocumentChunk.document_id == document_id)
+    async def delete_chunks_by_document_id(self, document_id: UUID) -> int:
+        """Delete all chunks belonging to a document (used before re-chunking).
+
+        Returns how many rows went, which is what lets a delete report what it
+        actually removed rather than echoing ``Document.chunk_count`` — those two
+        disagree for any document whose ingestion was interrupted part-way.
+        """
+        # ``execute`` is typed as returning ``Result``, which has no rowcount;
+        # a DML statement always yields a ``CursorResult``, which does.
+        result = cast(
+            "CursorResult[Any]",
+            await self._session.execute(
+                delete(DocumentChunk).where(DocumentChunk.document_id == document_id)
+            ),
         )
         await self._session.flush()
+        return result.rowcount or 0
 
     async def create_chunk(
         self,
@@ -177,6 +188,47 @@ class DocumentRepository:
         if document is None:
             raise DocumentNotFoundError(f"Document {document_id} not found")
         return document
+
+    async def get_document_for_owner(self, document_id: UUID, user_id: UUID) -> Document:
+        """Fetch a document, but only if this user owns it.
+
+        Someone else's document id raises ``DocumentNotFoundError`` — a 404, not
+        a 403, matching ``jobs.get_for_owner``: a 403 would confirm that the id
+        exists, which is exactly what a caller probing for other tenants' ids
+        wants to learn.
+        """
+        result = await self._session.execute(
+            select(Document).where(
+                Document.id == document_id,
+                Document.user_id == user_id,
+            )
+        )
+        document = result.scalar_one_or_none()
+        if document is None:
+            raise DocumentNotFoundError(f"Document {document_id} not found")
+        return document
+
+    async def delete_document(self, document: Document) -> int:
+        """Delete a document and its chunks, returning the chunk count removed.
+
+        Chunks are deleted explicitly rather than left to the ``ON DELETE
+        CASCADE`` on ``document_chunks.document_id``. The cascade is real and
+        would fire on Postgres, but it is the *database's* behaviour, not this
+        code's: SQLite (which the fast unit tests run on) does not enforce
+        foreign keys unless asked, so relying on it would leave orphan chunks
+        under test — and an orphan chunk still carries ``owner_id`` and is still
+        returned by retrieval, so the document would keep answering questions
+        after being deleted. Doing it here makes the outcome the same on both
+        engines and observable in a test.
+
+        Both statements share the caller's transaction, so a failure between
+        them rolls the whole delete back rather than stranding a document with
+        no chunks.
+        """
+        chunks_deleted = await self.delete_chunks_by_document_id(document.id)
+        await self._session.delete(document)
+        await self._session.flush()
+        return chunks_deleted
 
     async def _apply_ann_settings(self, ef_search: int, iterative_scan: str) -> None:
         """Set the HNSW query-time GUCs for the current transaction.
