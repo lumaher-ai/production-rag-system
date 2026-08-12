@@ -1,0 +1,29 @@
+# Out-of-domain questions for the unanswerable slice (decision G1).
+#
+# Hand-written and committed, NOT generated. Asking a language model for
+# "off-domain" questions against a RAG-engineering corpus produces
+# adjacent-technical questions — about vector databases, Postgres tuning,
+# embeddings — which this corpus does answer. That spends money to manufacture
+# false negatives: correct behaviour scored as failure.
+#
+# These test the other end of the refusal problem from the plausible-absent
+# slice. Retrieval should come back weak here, so a high top-1 similarity on any
+# of these is itself a finding about the embedding space.
+#
+# Blank lines and lines starting with # are ignored.
+
+What is the recommended dosage of amoxicillin for a twelve-year-old?
+Who won the 2018 FIFA World Cup final, and what was the score?
+How do I replace the timing belt on a 2009 Honda Civic?
+What is the boiling point of ethanol at sea level?
+Which vitamins are most concentrated in raw kale?
+How long should a beef brisket rest before slicing?
+What was the population of Lisbon in the 1981 census?
+How many sonnets did Shakespeare write?
+What is the standard tuning for a five-string banjo?
+When does the Atlantic hurricane season officially begin?
+What is the minimum wage in Ontario this year?
+How deep is the Mariana Trench at its lowest point?
+Which airline operates the longest scheduled nonstop flight?
+What is the gestation period of an African elephant?
+How do I get a mildew stain out of a cotton shirt?

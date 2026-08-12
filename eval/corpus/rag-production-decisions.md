@@ -869,105 +869,18 @@ paid for on every write.
 
 ### G1. What is the golden dataset, and where does it come from?
 
-- **State:** ✅ **DECIDED & IMPLEMENTED (2026-08-10)** — 150 LLM-seeded, machine-gated
-  Q/A/context triples over a committed seed corpus, stratified 50 paraphrase / 40 exact-term /
-  30 multi-hop / 30 unanswerable, with a verbatim-citation gate and a measured trivial baseline.
-  The hand-audit of a 50-item stratified sample is the remaining step.
-- **Was:** Nothing. No dataset, no fixtures beyond unit-test text. Every "Proof" line in Parts A–F
-  was unexecutable.
+- **State:** ❌
+- **Now:** Nothing. No dataset, no fixtures beyond unit-test text.
 - **Options:** (a) hand-curated Q/A + gold chunk ids; (b) LLM-generated from your own corpus
   (question ← chunk, so the gold context is known by construction); (c) public benchmark;
   (d) production query logs, once they exist.
-- **Decision taken:** **(b) seeded, then (a) hand-audited**, as called. `gpt-4o-mini` reads chunks
-  the system actually ingested and returns 3–5 questions each, every one citing the exact span
-  that answers it; automatic gates discard what does not survive; a human audits a stratified
-  sample of 50 and the curated file is built from those verdicts. `python -m production_rag.eval`.
-  - **Corpus: this repository's own documentation**, frozen under `eval/corpus/` and ingested
-    through the real pipeline (`IngestionService.ingest_now`) under a dedicated `eval@localhost`
-    user — 255 chunks across four documents, 185 of them eligible after the token filter. Real
-    prose the system genuinely ingests, and unusually dense in exact-term targets
-    (`hnsw.iterative_scan`, `nfkc-ws-v1`, `jsonb_path_ops`, decision ids). The copies are frozen
-    on purpose: chunk boundaries are a deterministic function of a document's text, so editing
-    `README.md` would shift every index after the edit and silently re-point the gold set.
-  - **Gold identity is `(document_key, chunk_index)`, never `DocumentChunk.id`.** Chunk ids are
-    `uuid4` and every re-ingest deletes and re-creates the rows, so a dataset keyed on them points
-    at nothing the morning after a `reindex`. Nor is `document_id` portable — it is also a `uuid4`,
-    stable across a re-ingest but not across a fresh database — and nor is the `source` URI, since
-    `upload://` embeds the owner's UUID. The corpus **filename** is the one identifier that
-    survives a fresh checkout, a fresh database and a fresh user. Every gold entry also carries the
-    sha256 of its chunk's content as a **drift tripwire**: the key still resolves after a chunker
-    change, and only the hash reveals that it now resolves to *different text*.
-  - **The verbatim-citation gate is the load-bearing control.** A cited snippet must be a literal
-    substring of the chunk's stored `content` *after* `normalize_text` on both sides — comparing
-    raw text would fail every snippet containing a ligature or a non-breaking space for reasons
-    that have nothing to do with the model. Whitespace reflow is recovered (the chunk's own span is
-    stored, not the model's reconstruction); anything else is dropped. **40 of the model's citations
-    were not verbatim and were discarded** — the prompt is a hint, the gate is the guarantee.
-  - **Chunk overlap is gold, not error.** `CHUNK_OVERLAP` is 200 characters, so a verified snippet
-    is also tested against its neighbours; where it matches there too, those chunks become secondary
-    gold (7 entries did). Without that, `Recall@1` would punish the retriever for returning the
-    adjacent chunk holding the identical sentence — a defect built into the ruler rather than a
-    property of the system being measured.
-  - **The unanswerable slice is verified, not asserted.** The generator sees one chunk; the corpus
-    has hundreds, so a "negative" may well be answered three documents away — and such an item
-    converts correct behaviour into a permanent scored failure. Every candidate therefore runs
-    through real `retrieve()` and is then judged by a **different model** (`claude-haiku`), the
-    same self-judging argument G3 makes about the answer judge, applied one phase early. It fails
-    closed: an unparseable verdict discards the item. **7 candidates were caught this way.**
-    25 of the 30 are `plausible_absent` (seeded from a real chunk, so they retrieve
-    confident-looking context and test whether the system refuses anyway — this is precisely E6);
-    5 are `out_of_corpus`, hand-written rather than generated, because a model asked for
-    "off-domain" questions against a RAG-engineering corpus drifts to vector databases and
-    Postgres tuning, which this corpus *does* cover.
-  - **Structured output** came from one additive parameter on `LLMClient.chat`
-    (`response_format`, default `None`) plus a four-pass tolerant JSON parser. The parser is not
-    redundant with the schema: `litellm.drop_params` is global and `chat()` always passes
-    `fallbacks=[fallback_model]`, so a rate limit silently drops `response_format` and hands
-    Claude's fenced JSON to a caller that was promised a schema. Every record therefore also
-    records the model that **served** it, not just the one requested.
-- **Proof (measured, not asserted):** a trivial baseline does not score on it.
-  `python -m production_rag.eval baseline --with-retrieval`, Recall@10 over the 120 answerable
-  questions, 255 chunks:
-
-  | baseline | expected | measured |
-  |---|---|---|
-  | random-chunk (10 of 255) | 0.039 | **0.025** |
-  | first-10 of a random document | — | **0.079** |
-  | first-10 of the largest document | — | **0.037** |
-  | real retrieval (`retrieve`, `use_cache=False`) | — | **0.846** |
-
-  Random scores at chance, below the 0.10 ceiling; real retrieval clears the best trivial baseline
-  by 0.767 against a required margin of 0.40. The command exits non-zero if either check fails, so
-  this is a gate rather than a table somebody reads. Note that 0.846 is *not* a claim about
-  retrieval quality yet — it is the evidence that the instrument can tell retrieval from noise.
-- **What it cost:** 270 LLM calls, **$0.14**, ~4 minutes. The expensive part of G1 is the human
-  hour, which is the correct place for the expense to be.
-- **Gate attrition, since it is a finding rather than plumbing:** 121 candidates discarded —
-  40 non-verbatim citations, 23 self-referential questions ("according to the document…", which no
-  retrieval system can answer because they name no searchable subject), 7 unanswerables the corpus
-  could actually answer, 1 answer leaked into its own question, and 50 over quota.
-- **Trade-off accepted:** the corpus is one domain, one language, and written by the same author as
-  the system under test, so absolute numbers generalize poorly. It measures **regressions in this
-  system**, which is what G5 needs — not RAG quality in the abstract. And at 30–50 items per
-  stratum a stratum-level Recall@10 carries roughly ±0.10 of sampling noise; deltas smaller than
-  that are not findings.
-- **Unproven, and worth saying so:** with a single reviewer, "inter-rater agreement on a sample"
-  is not available. The honest substitute is the **acceptance rate on the audited 50**, published
-  alongside an explicit *not measured* for agreement, rather than a κ of 1.0 against oneself.
-- **Follow-ups this opened:** **G2** now has a schema to read (`gold` keys, `query_type`,
-  `answerable`) and one metric already written (`recall_at_k`) to sit beside nDCG/MRR/Precision@5 —
-  note that unanswerable records must be excluded from those denominators, since `gold == []` makes
-  recall `0/0` and averaging in a zero would understate every retrieval number by about a fifth.
-  **E6/F2** gain the negative slice that makes an abstention threshold pickable at all: the
-  distribution of top-1 similarity over answerable versus unanswerable questions is the calibration
-  data, and it did not exist before. **G3**'s separate-judge harness is already built and exercised
-  by the unanswerable verifier. And `DocumentRepository` gained the chunk-read methods
-  (`list_chunks_for_owner`, `get_chunks_by_keys`, `count_chunks_for_owner`) that make
-  `(document, chunk_index)` a resolvable identity rather than a convention.
-- **Still owed:** the near-duplicate gate uses 3-word-shingle Jaccard at 0.70 and lets through pairs
-  that differ only in a trailing prepositional phrase; two such pairs are visible in the first
-  audit sheet. Raising the threshold blindly would delete good items, so the calibration should come
-  from the audit's own reject reasons rather than from a guess.
+- **Call:** **(b) seeded, then (a) hand-audited** — generate 150 Q/A/context triples from
+  documents you actually ingest, then review them by hand and discard the bad ones. Deliberately
+  stratify by query type: **paraphrase, exact-term, multi-hop, and unanswerable.** The unanswerable
+  slice is the one most systems omit and the one that measures E6/F2 — without it you cannot
+  distinguish "correctly refuses" from "never finds anything."
+- **Proof:** The dataset is the instrument. Its own quality check is inter-rater agreement on a
+  sample and confirmation that a trivial baseline does *not* score well on it.
 
 ### G2. Which retrieval metrics, at which thresholds?
 
@@ -1212,12 +1125,10 @@ awkward** — `metadata` proved that a schema change is one migration, which rem
 for a dimension hardcoded in three places.
 
 ### Tier 1 — Build the instrument
-7. ~~**G1** — golden dataset.~~ **Done 2026-08-10** — 150 stratified triples, machine-gated, with a
-   measured trivial baseline. Hand-audit of 50 outstanding.
-8. **G2–G5** — retrieval metrics, generation metrics, harness, CI gate.
+7. **G1–G5** — golden dataset, retrieval metrics, generation metrics, harness, CI gate.
 
 *Everything in Tiers 2–3 is a guess until this exists. It is also the strongest portfolio artifact
-in the report. G1 built the ruler; G2–G5 are what make anything get measured with it.*
+in the report.*
 
 ### Tier 2 — Retrieval quality, now measurable
 8. **C3 + E2 + E3** — hybrid retrieval and RRF fusion.

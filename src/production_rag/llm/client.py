@@ -61,11 +61,21 @@ class LLMClient:
         temperature: float = 0.0,
         tools: list[dict] | None = None,
         tool_choice: str | dict | None = None,
+        response_format: dict | None = None,
     ) -> LLMResponse:
         """Send a chat completion request through LiteLLM.
 
         Works with any provider: OpenAI, Anthropic, Bedrock, etc.
         LiteLLM normalizes the interface — all models use OpenAI message format.
+
+        ``response_format`` requests structured output, e.g. a
+        ``{"type": "json_schema", ...}`` block. **It is a request, not a
+        guarantee, and callers must parse defensively.** ``litellm.drop_params``
+        is True module-wide and this method always passes ``fallbacks``, so a
+        rate limit on the primary provider silently drops the parameter and
+        serves the call from a model that never saw it. ``LLMResponse.model``
+        reports which model actually answered; a caller that cares should check
+        it rather than assume.
         """
         model = model or self._settings.default_model
         start_time = time.perf_counter()
@@ -88,6 +98,8 @@ class LLMClient:
             kwargs["tools"] = tools
         if tool_choice:
             kwargs["tool_choice"] = tool_choice
+        if response_format:
+            kwargs["response_format"] = response_format
 
         try:
             response = await acompletion(

@@ -339,6 +339,41 @@ class Settings(BaseSettings):
         description="Fallback model if primary fails",
     )
 
+    # Evaluation dataset generation (decision G1)
+    eval_generator_model: str = Field(
+        default="gpt-4o-mini",
+        description=(
+            "Model that writes the synthetic eval questions. Deliberately separate "
+            "from DEFAULT_MODEL: the dataset's provenance must not change because "
+            "the application's chat model was swapped, and a record naming the "
+            "wrong generator is a silently corrupted instrument."
+        ),
+    )
+    eval_verifier_model: str = Field(
+        default="claude-haiku-4-5-20251001",
+        description=(
+            "Model that checks whether an 'unanswerable' question is really "
+            "unanswerable against what retrieval returned. Must differ from "
+            "EVAL_GENERATOR_MODEL — a model grading its own output inflates the "
+            "verdict, which is the same reason G3 requires a separate judge."
+        ),
+    )
+    eval_generation_concurrency: int = Field(
+        default=5,
+        description=(
+            "Concurrent eval-generation calls. A full run is ~120 requests, so this "
+            "bounds rate-limit exposure rather than throughput."
+        ),
+    )
+    eval_user_email: str = Field(
+        default="eval@localhost",
+        description=(
+            "Owner of the eval seed corpus. Retrieval is scoped by owner_id, so the "
+            "eval corpus lives under its own user and can neither pollute nor be "
+            "polluted by a real user's documents."
+        ),
+    )
+
     # Debug observability
     debug_dir: str = Field(
         default="debug_runs",

@@ -1,11 +1,12 @@
 import json
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID
 
-from sqlalchemy import CursorResult, delete, or_, select, text, update
+from sqlalchemy import CursorResult, delete, func, or_, select, text, update
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import aliased
+from sqlalchemy.orm import aliased, defer
 
 from production_rag.exceptions import NotFoundError
 from production_rag.logging_config import get_logger
@@ -332,6 +333,96 @@ class DocumentRepository:
             select(chunk, subquery.c.distance).order_by(subquery.c.distance)
         )
         return [(row[0], 1.0 - row.distance) for row in result.all()]
+
+    async def list_chunks_for_owner(
+        self,
+        user_id: UUID,
+        limit: int = 2000,
+        offset: int = 0,
+    ) -> list[DocumentChunk]:
+        """Every chunk this user owns, in stable ``(document_id, chunk_index)`` order.
+
+        Ordered by that pair rather than by ``created_at`` because the pair *is*
+        a chunk's durable identity: ``DocumentChunk.id`` is a fresh ``uuid4`` on
+        every ingestion pass, so anything keyed on it points at nothing the
+        morning after a re-index. A reader that took rows in insertion order
+        would also silently reorder itself whenever one document is re-ingested,
+        which would change the sample a seeded eval run picks without changing
+        the seed.
+
+        ``embedding`` is deferred: this returns text for callers that read chunk
+        content, and shipping 1536 floats per row to a consumer that never looks
+        at them is pure transfer cost. Callers needing the vector should touch
+        ``chunk.embedding``, which will lazily load it, or use
+        ``search_similar_chunks``.
+        """
+        result = await self._session.execute(
+            select(DocumentChunk)
+            .options(defer(DocumentChunk.embedding))
+            .where(DocumentChunk.owner_id == user_id)
+            .order_by(DocumentChunk.document_id, DocumentChunk.chunk_index)
+            .limit(limit)
+            .offset(offset)
+        )
+        return list(result.scalars().all())
+
+    async def get_chunks_by_keys(
+        self,
+        user_id: UUID,
+        keys: Sequence[tuple[UUID, int]],
+    ) -> dict[tuple[UUID, int], DocumentChunk]:
+        """Resolve stable ``(document_id, chunk_index)`` keys back to rows.
+
+        This is what makes that pair a real identity rather than a convention:
+        the eval dataset stores those keys and nothing else, so every consumer —
+        snippet verification, the audit sheet, the metrics harness — comes back
+        through here.
+
+        Missing keys are simply absent from the result rather than raising. A
+        caller that finds a key unresolved is looking at a dataset whose corpus
+        has moved underneath it, and letting it see *which* keys died is more
+        useful than aborting on the first one.
+
+        Issued as one ``document_id IN (...) AND chunk_index IN (...)`` query
+        with the exact pairs filtered in Python. A row-value ``IN`` over tuples
+        would be tighter, but the fast unit-test path runs on SQLite and this
+        form behaves identically on both engines; the over-fetch is bounded by
+        the number of keys asked for.
+        """
+        if not keys:
+            return {}
+
+        wanted = set(keys)
+        result = await self._session.execute(
+            select(DocumentChunk)
+            .options(defer(DocumentChunk.embedding))
+            .where(
+                DocumentChunk.owner_id == user_id,
+                DocumentChunk.document_id.in_({document_id for document_id, _ in wanted}),
+                DocumentChunk.chunk_index.in_({index for _, index in wanted}),
+            )
+        )
+        found: dict[tuple[UUID, int], DocumentChunk] = {}
+        for chunk in result.scalars().all():
+            key = (chunk.document_id, chunk.chunk_index)
+            if key in wanted:
+                found[key] = chunk
+        return found
+
+    async def count_chunks_for_owner(self, user_id: UUID) -> int:
+        """How many chunks this user owns.
+
+        The denominator a random-chunk baseline needs in order to state its own
+        expected score (``k / N``) *before* it is run — a measured number that
+        matches a prediction made in advance is evidence; one that merely looks
+        low is not.
+        """
+        result = await self._session.execute(
+            select(func.count())
+            .select_from(DocumentChunk)
+            .where(DocumentChunk.owner_id == user_id)
+        )
+        return int(result.scalar_one())
 
     async def document_has_provenance(self, document_id: UUID) -> bool:
         """Whether any of this document's chunks carry page or section values.

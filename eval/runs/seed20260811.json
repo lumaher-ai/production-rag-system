@@ -1,0 +1,20 @@
+{
+  "cost_usd": 0.071877,
+  "dropped": {
+    "over_quota:exact_term": 37,
+    "over_quota:multi_hop": 26,
+    "over_quota:paraphrase": 41,
+    "over_quota:unanswerable": 47,
+    "self_referential": 4,
+    "snippet_not_verbatim": 19,
+    "unanswerable_is_actually_answerable": 2
+  },
+  "generated": {},
+  "llm_calls": 128,
+  "run_id": "seed20260811",
+  "seed": 20260811,
+  "served_models": {
+    "gpt-4o-mini-2024-07-18": 79
+  },
+  "written": 0
+}

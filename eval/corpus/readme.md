@@ -20,7 +20,7 @@
 
 This repo implements the **RAG pipeline end-to-end**: upload a PDF/DOCX/HTML/Markdown file → extract with page & section provenance → chunk → embed → store in pgvector behind an **HNSW index** → retrieve by cosine similarity with scores → ground an LLM answer with source citations and per-request cost tracking. Re-uploading an unchanged source is a genuine no-op; an edited one is replaced transactionally. It runs today.
 
-It is **not yet a "production" RAG system**, and this README won't pretend otherwise. There is no reranking and no hybrid/keyword search. There is now a [golden dataset](#evaluation) — 150 stratified, machine-gated questions with verified gold context — but **no harness measuring anything against it yet**, so the chunk size, the embedding model, and the index parameters remain defaults rather than defended choices. The [decision report](docs/rag-production-decisions.md) enumerates what's left as ~49 explicit engineering decisions, including several correctness bugs that only surface under multi-tenant load.
+It is **not yet a "production" RAG system**, and this README won't pretend otherwise. There is no reranking, no hybrid/keyword search, and — most importantly — **no evaluation harness**, which means the chunk size, the embedding model, and the index parameters are all defaults rather than defended choices. The [decision report](docs/rag-production-decisions.md) enumerates what's left as ~49 explicit engineering decisions, including several correctness bugs that only surface under multi-tenant load.
 
 > **Why build it this way?** A convincing engineering artifact isn't a demo that hides its seams — it's a system with a clear boundary between *what's built*, *what's measured*, and *what's next*. That boundary is the whole point of this repo.
 
@@ -103,7 +103,7 @@ Honest inventory, verified against the source. ✅ = implemented and running · 
 | **Retrieval** | ⚠️ | Dense cosine top-k, user-scoped, **similarity scores returned**; `retrieve()` split out from `query()` so it's measurable without an LLM; **metadata filtering applied inside the ANN query** (see below) | Vector-only — no hybrid/keyword, so exact-match queries have no working path; filters are flat equality only (no ranges, no OR); no score threshold or abstention |
 | **Reranking** | ❌ | — | No second-stage reranker or rank fusion |
 | **Generation** | ✅ | Grounded prompt, per-source citations with scores, cost tracking, provider fallback, TTL answer cache that evals can bypass | No streaming; no claim-level citation mapping; prompt is unversioned and absent from the cache key |
-| **Evaluation** | ⚠️ | **150-question golden dataset**, LLM-seeded from the repo's own frozen docs and stratified into paraphrase / exact-term / multi-hop / **unanswerable**. Gold context keyed on `(document, chunk_index)` — never on chunk UUIDs, which are regenerated on every re-ingest — with a sha256 drift tripwire, a verbatim-citation gate, and an independent model verifying that every "unanswerable" really is. A trivial random baseline scores **0.025** against real retrieval's **0.846**, so the dataset is *shown* to discriminate | No metrics harness (Recall@k / nDCG / MRR — **G2**), no generation judge (**G3**), no CI regression gate (**G5**). **The instrument exists; nothing is measured with it yet, which is why five rows above are still ⚠️ rather than ✅.** |
+| **Evaluation** | ❌ | — | No dataset, no retrieval/generation metrics, no regression gate. **This is why five rows above are ⚠️ rather than ✅.** |
 | **API** | ⚠️ | Upload / ingest-by-URI / query / list / job status / failure list + retry, JWT-auth | No delete, no streaming endpoint, no rate limiting, unbounded `top_k` |
 | **Deployment** | ⚠️ | `docker-compose` runs Postgres + Redis | No app or worker Dockerfile, no CI/CD, no live deploy, no real readiness probe |
 
@@ -177,61 +177,6 @@ similarity score is what an eval harness ranks on, so it cannot be left approxim
 That mitigation is applied and its settings are asserted in the test suite, but the corpus needed to
 *reproduce* the collapse is larger than a test should build — so it is not yet proven at scale. See
 [D3](docs/rag-production-decisions.md) for the experiment that would close it.
-
----
-
-## 🎯 Evaluation: building the golden dataset
-
-*Recall@k is the ceiling.* If the right chunk is not retrieved, no reranker, no prompt and no model
-recovers it — every downstream metric is bounded by that number. Measuring it needs a dataset whose
-gold context is known by construction, so this repo generates one and then has a human check it.
-
-```bash
-uv run python -m production_rag.cli create-admin eval@localhost Eval <password>
-uv run python -m production_rag.eval seed-corpus     # ingest eval/corpus/*.md (frozen snapshots)
-uv run python -m production_rag.eval generate --dry-run   # sampling plan + cost, no API calls
-uv run python -m production_rag.eval generate        # ~270 calls, ~$0.15, resumable
-uv run python -m production_rag.eval trim            # cut to exactly 50/40/30/30
-uv run python -m production_rag.eval baseline --with-retrieval   # exits non-zero if it fails
-
-uv run python -m production_rag.eval audit-sheet --n 50   # → eval/audit/audit-<run>.md
-#  ... you fill in `decision:` on each item ...
-uv run python -m production_rag.eval audit-apply     # → eval/dataset.jsonl
-```
-
-Four things about it are deliberate and are the reason it is worth reading:
-
-**The corpus is frozen, not live.** `eval/corpus/*.md` are byte-for-byte copies of this repo's own
-documentation, and they are never synced with the originals. Chunk boundaries are a deterministic
-function of a document's text, so editing `README.md` would shift every chunk index after the edit
-and silently re-point every question at different text.
-
-**Gold context is keyed on `(document, chunk_index)`, never on a chunk UUID.** Chunk ids are
-`uuid4` and every re-ingest deletes and re-creates the rows — a dataset keyed on them stops meaning
-anything the first time you run `reindex`. Each gold entry also carries the sha256 of its chunk, so
-a chunker change is *detected* rather than silently absorbed.
-
-**Every citation is verified, not trusted.** The generator is told to copy the answering span
-character-for-character; the gate then checks it really is a substring of the stored chunk.
-40 citations were not, and were discarded. The prompt is a hint; the gate is the guarantee.
-
-**The unanswerable slice is the point.** 30 questions the corpus cannot answer — most of them
-seeded from a real chunk, so they retrieve confident-looking context and test whether the system
-refuses *anyway*. Without them you cannot distinguish "correctly refuses" from "never finds
-anything", and you have no data from which to pick an abstention threshold. Each one is checked
-against real retrieval by a **different** model than the generator; 7 turned out to be answerable
-and were dropped, because a bad negative scores correct behaviour as failure forever.
-
-The dataset's own quality check, which the `baseline` command enforces as a gate:
-
-| baseline | expected | measured Recall@10 |
-|---|---|---|
-| random 10 chunks of 255 | 0.039 | **0.025** |
-| first 10 chunks of a random document | — | **0.079** |
-| first 10 chunks of the largest document | — | **0.037** |
-| real retrieval | — | **0.846** |
-
-A dataset a random retriever scores on is not measuring retrieval. This one isn't.
 
 ---
 
@@ -404,18 +349,11 @@ src/production_rag/
 ├── models/          # SQLAlchemy models (Document, DocumentChunk, User)
 ├── schemas/         # Pydantic request/response contracts
 ├── agent/           # Tool-calling agent loop over the RAG tools
-├── eval/            # Golden-dataset generator, quality gates, audit workflow (G1)
 ├── config.py        # Pydantic-settings configuration
 └── main.py          # App factory & wiring
 migrations/          # Alembic migrations
 tests/               # Pytest suite (async, testcontainers)
 docs/                # Technical report & roadmap
-eval/                # The dataset itself — frozen corpus, silver + curated JSONL, audit sheets
-├── corpus/          # Frozen doc snapshots. Never synced with the originals — see FROZEN.txt
-├── dataset.silver.jsonl    # 150 machine-generated, machine-gated records
-├── dataset.rejected.jsonl  # what the gates threw away, with the reason
-├── dataset.jsonl           # curated — only ever produced from human verdicts
-└── audit/           # review sheets and the verdicts parsed back out of them
 ```
 
 ---
@@ -430,8 +368,7 @@ Sequenced by *what unblocks the most other decisions*. Every remaining choice �
 - ✅ **A2 — Async ingestion** · Redis/arq queue, job status table, batch checkpointing with resume, orphan recovery. Upload of a large document returns in ~80ms instead of ~40–60s.
 - ✅ **A4 + E4 — Metadata & hybrid filtering** · Extractive metadata (language, document date, doc type, MIME) in a GIN-indexed `metadata JSONB` column, and the previously-dead `filters` parameter implemented over it as JSONB containment inside the ANN query.
 - 🔜 **Tier 0 — Correctness first** · Four defects still open of the original six: mixed embedding models ranking silently, hardcoded vector dimension, unbounded context, default JWT secret. The `filters` parameter is now implemented rather than removed; filtered-ANN recall is mitigated (`hnsw.iterative_scan` + explicit `ef_search`) but **not yet proven at scale** — the multi-tenant recall experiment is the outstanding item.
-- ✅ **G1 — Golden dataset** · 150 Q/A/gold-context triples generated from the repo's own frozen documentation and stratified 50 paraphrase / 40 exact-term / 30 multi-hop / **30 unanswerable**. Every citation is verified to be a literal span of the chunk it cites (40 that weren't were discarded); every unanswerable is checked against real retrieval by a *different* model (7 were answerable and were dropped). A random baseline scores 0.025 where retrieval scores 0.846 — the dataset discriminates. `uv run python -m production_rag.eval --help`
-- 🔜 **Tier 1 — Evaluation harness** · Retrieval metrics (Recall@k, MRR, nDCG) stratified by the G1 query types, generation metrics (faithfulness, relevance, correctness) judged by a different model than the generator, CI regression gate. **Everything below is still a guess until this exists** — G1 built the ruler; this is what measures with it.
+- 🔜 **Tier 1 — Evaluation pipeline** · Golden Q/A + gold-context dataset stratified by query type, retrieval metrics (Recall@k, MRR, nDCG), generation metrics (faithfulness, relevance, correctness), CI regression gate. **Everything below is a guess until this exists.**
 - **Tier 2 — Hybrid retrieval + reranking** · `tsvector` keyword search, Reciprocal Rank Fusion, cross-encoder reranker (retrieve top-30 → rerank to top-5), abstention threshold — each adopted only if the numbers justify it.
 - **Tier 3 — Deployment & hardening** · Async ingestion with status, app Dockerfile, CI (ruff/mypy/pytest + eval gate), a real deploy target, streaming + delete + rate limiting, metrics and cost aggregation.
 - **Tier 4 — Deliberately deferred** · Query rewriting, feedback loops, hierarchical/Graph/agentic RAG — with the adoption trigger for each written down rather than silently skipped.
@@ -452,9 +389,7 @@ Sequenced by *what unblocks the most other decisions*. Every remaining choice �
 
 These are tracked, not hidden — each maps to a decision in the [decision report](docs/rag-production-decisions.md):
 
-- **A dataset, but nothing measuring with it** → the golden set exists and is shown to discriminate, but there is no Recall@k / nDCG / MRR harness, no generation judge, and no CI gate — so the chunk size, the embedding model, and the HNSW parameters are still defaults rather than defended choices. This remains the top priority. *(G2–G5)*
-- **The eval corpus is self-referential** → the dataset is generated from this repository's own documentation, so it is one domain, one language, and written by the author of the system it grades. It measures *regressions in this system*, which is what a CI gate needs; it does not measure RAG quality in general. At 30–50 items per stratum, stratum-level deltas under ±0.10 are sampling noise, not findings. *(G1)*
-- **The golden set is machine-gated but not yet hand-audited** → 121 bad candidates were caught automatically, but the 50-item human review that G1 calls for has not been applied, so the published quality number is still the baseline separation rather than an acceptance rate. With one reviewer, inter-rater agreement will remain *not measured* rather than be faked. *(G1)*
+- **No evaluation** → retrieval and answer quality are not measured, which is why the chunk size, the embedding model, and the HNSW parameters are defaults rather than defended choices. This is the top priority, not the last phase. *(Part G)*
 - **Vector-only retrieval** → no keyword/hybrid channel, so exact-match queries (IDs, acronyms, proper nouns) have no working retrieval path; no reranking precision lift. *(E2, E5)*
 - **Filtered-ANN recall — mitigated, unproven** → pgvector applies filters *after* the HNSW graph walk, so a multi-tenant or metadata-filtered query can silently return fewer results than requested. `hnsw.iterative_scan` and an explicit `ef_search` are now set per query, and the test suite asserts they are really in force — but at test corpus size the query returns a full page *with the fix disabled too*, so nothing here has yet demonstrated the fix works. Reproducing the collapse needs tens of thousands of vectors. Treat it as plausible, not proven. *(D3)*
 - **Heuristic document typing** → `doc_type` is keyword-matched over a closed set of 7 classes with Spanish/English markers only, so a document outside that set (or in another language) lands in `other` and is invisible to a `doc_type` filter. Deliberately extractive — no model call in the ingest path — but it is the weakest of the four metadata fields. *(A4)*

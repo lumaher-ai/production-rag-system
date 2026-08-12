@@ -1,0 +1,22 @@
+These four Markdown files are FROZEN SNAPSHOTS, not the live documents.
+
+They are byte-for-byte copies of README.md, docs/rag-production-decisions.md,
+docs/rag-production-roadmap.md and docs/document-ai-setup.md, taken 2026-08-10.
+
+Do not "sync" them with the originals.
+
+The eval dataset keys its ground truth on (document_source, chunk_index). Chunk
+boundaries are a deterministic function of the document's text, so editing one
+of these files shifts every chunk index after the edit and silently re-points
+every question in eval/dataset.jsonl at whatever text landed at that index. The
+content_sha256 on each gold entry catches it — the dataset would start failing
+loudly — but the only fix at that point is to regenerate and re-audit, which
+costs a human afternoon.
+
+The originals are free to change. That is the entire reason these copies exist.
+
+If you deliberately want the dataset to track newer documentation: replace these
+files, re-run `seed-corpus` and `generate`, and audit the result again. Treat it
+as a new dataset version, not an update.
+
+This file is a .txt so the loader (which globs *.md) never ingests it.
