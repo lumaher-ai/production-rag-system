@@ -1,7 +1,7 @@
 """Operational commands.
 
-    uv run python -m production_rag.cli create-admin <email> <name> <password>
-    uv run python -m production_rag.cli reindex [--dry-run] [--limit N]
+uv run python -m production_rag.cli create-admin <email> <name> <password>
+uv run python -m production_rag.cli reindex [--dry-run] [--limit N]
 """
 
 import argparse
@@ -84,8 +84,10 @@ async def reindex(dry_run: bool = False, limit: int = 500) -> int:
                 f"{doc.chunker_version:<20} {doc.source[:40]}{marker}"
             )
 
-        print(f"\ncurrent: normalizer={NORMALIZER_VERSION} chunker={CHUNKER_VERSION} "
-              f"embedding={settings.embedding_model}")
+        print(
+            f"\ncurrent: normalizer={NORMALIZER_VERSION} chunker={CHUNKER_VERSION} "
+            f"embedding={settings.embedding_model}"
+        )
 
         if dry_run:
             print("\n--dry-run: nothing enqueued.")

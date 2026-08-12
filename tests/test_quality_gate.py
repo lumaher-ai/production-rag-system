@@ -134,9 +134,7 @@ async def _auth_token(client: AsyncClient, email: str) -> str:
         "/auth/signup",
         json={"name": "Gatekeeper", "email": email, "password": "securepass123"},
     )
-    login = await client.post(
-        "/auth/login", json={"email": email, "password": "securepass123"}
-    )
+    login = await client.post("/auth/login", json={"email": email, "password": "securepass123"})
     return login.json()["access_token"]
 
 

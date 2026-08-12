@@ -55,9 +55,7 @@ def list_block(items: list[str], page: int = 1) -> Block:
 
 
 def document(blocks: list[Block]) -> documentai.Document:
-    return documentai.Document(
-        document_layout=documentai.Document.DocumentLayout(blocks=blocks)
-    )
+    return documentai.Document(document_layout=documentai.Document.DocumentLayout(blocks=blocks))
 
 
 class FakeDocumentAIClient:
@@ -103,6 +101,5 @@ class FakeDocumentAIClient:
         from pypdf import PdfReader
 
         return [
-            len(PdfReader(BytesIO(request.raw_document.content)).pages)
-            for request in self.requests
+            len(PdfReader(BytesIO(request.raw_document.content)).pages) for request in self.requests
         ]

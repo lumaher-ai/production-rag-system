@@ -59,6 +59,7 @@ class ScoredChunk:
     chunk: DocumentChunk
     score: float
 
+
 # Chunking config
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
@@ -138,6 +139,7 @@ def build_chunks(segments: list[ExtractedSegment]) -> tuple[str, list[PreparedCh
         base_offset += len(seg.text) + sep_len
 
     return full_content, chunks
+
 
 # Prompt
 
@@ -282,9 +284,7 @@ class DocumentService:
         # Step 2: Build context from chunks (Augmented)
         context_parts = []
         for i, sc in enumerate(scored_chunks):
-            context_parts.append(
-                f"[Source {i + 1}: {sc.chunk.document_title}]\n{sc.chunk.content}"
-            )
+            context_parts.append(f"[Source {i + 1}: {sc.chunk.document_title}]\n{sc.chunk.content}")
         context = "\n\n---\n\n".join(context_parts)
 
         # Step 3: Call LLM with context (Generation)

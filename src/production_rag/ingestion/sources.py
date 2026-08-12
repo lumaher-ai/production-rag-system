@@ -119,8 +119,7 @@ def parse_source_uri(raw: str) -> ParsedSource:
     authority = split.netloc
     if not authority:
         raise InvalidSourceURIError(
-            f"Source '{uri}' is missing its authority "
-            f"(expected {scheme}://<something>/...)."
+            f"Source '{uri}' is missing its authority (expected {scheme}://<something>/...)."
         )
 
     path = unquote(split.path.lstrip("/"))

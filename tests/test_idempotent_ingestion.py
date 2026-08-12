@@ -117,14 +117,10 @@ async def test_unchanged_reingest_does_not_re_extract_metadata(
     token = await _auth_token(pg_async_client, "extract-once@example.com")
     content = b"stable body uploaded twice, unchanged. " * 50
 
-    await _upload(
-        pg_async_client, token, "stable.txt", content, pg_session, job_queue, mock_emb
-    )
+    await _upload(pg_async_client, token, "stable.txt", content, pg_session, job_queue, mock_emb)
     assert len(calls) == 1, "the first ingest must extract"
 
-    await _upload(
-        pg_async_client, token, "stable.txt", content, pg_session, job_queue, mock_emb
-    )
+    await _upload(pg_async_client, token, "stable.txt", content, pg_session, job_queue, mock_emb)
     assert len(calls) == 1, "an unchanged re-ingest must not extract again"
 
     app.dependency_overrides.pop(get_embedding_service, None)
@@ -164,17 +160,21 @@ async def test_reupload_edited_source_replaces_document(
     doc_id = UUID(edited["id"])
     # Exactly one document row for this source (no duplicate was created).
     docs = (
-        await pg_session.execute(select(Document.id).where(Document.id == doc_id))
-    ).scalars().all()
+        (await pg_session.execute(select(Document.id).where(Document.id == doc_id))).scalars().all()
+    )
     assert docs == [doc_id]
 
     # Old chunks are gone: the persisted chunk count matches the edited response
     # and no chunk carries the original body.
     chunk_rows = (
-        await pg_session.execute(
-            select(DocumentChunk.content).where(DocumentChunk.document_id == doc_id)
+        (
+            await pg_session.execute(
+                select(DocumentChunk.content).where(DocumentChunk.document_id == doc_id)
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     assert len(chunk_rows) == edited["chunk_count"]
     assert all("original clause" not in c for c in chunk_rows)
     assert any("rewritten" in c for c in chunk_rows)
@@ -190,12 +190,22 @@ async def test_different_source_creates_new_document(
     token = await _auth_token(pg_async_client, "distinct@example.com")
 
     r1 = await _upload(
-        pg_async_client, token, "a.txt", b"alpha content here " * 30,
-        pg_session, job_queue, mock_emb,
+        pg_async_client,
+        token,
+        "a.txt",
+        b"alpha content here " * 30,
+        pg_session,
+        job_queue,
+        mock_emb,
     )
     r2 = await _upload(
-        pg_async_client, token, "b.txt", b"beta content here " * 30,
-        pg_session, job_queue, mock_emb,
+        pg_async_client,
+        token,
+        "b.txt",
+        b"beta content here " * 30,
+        pg_session,
+        job_queue,
+        mock_emb,
     )
 
     # Distinct sources → distinct documents, each embedded once.
@@ -213,18 +223,27 @@ async def test_chunks_carry_owner_id(
     token = await _auth_token(pg_async_client, "owner@example.com")
 
     resp = await _upload(
-        pg_async_client, token, "owned.txt", b"owned content to chunk " * 40,
-        pg_session, job_queue, mock_emb,
+        pg_async_client,
+        token,
+        "owned.txt",
+        b"owned content to chunk " * 40,
+        pg_session,
+        job_queue,
+        mock_emb,
     )
     doc_id = UUID(resp["id"])
 
     document = await pg_session.get(Document, doc_id)
     assert document is not None
     owner_ids = (
-        await pg_session.execute(
-            select(DocumentChunk.owner_id).where(DocumentChunk.document_id == doc_id)
+        (
+            await pg_session.execute(
+                select(DocumentChunk.owner_id).where(DocumentChunk.document_id == doc_id)
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     assert owner_ids  # chunks exist
     assert all(oid == document.user_id for oid in owner_ids)  # denormalized owner matches
 

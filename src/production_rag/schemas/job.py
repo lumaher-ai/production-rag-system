@@ -40,12 +40,9 @@ class JobStatusResponse(BaseModel):
     )
     document_id: UUID | None = Field(
         default=None,
-        description="Set once the job succeeds — the document is queryable from "
-        "that point.",
+        description="Set once the job succeeds — the document is queryable from that point.",
     )
-    error: str | None = Field(
-        default=None, description="Failure message, when status is 'failed'."
-    )
+    error: str | None = Field(default=None, description="Failure message, when status is 'failed'.")
     failure_reason: str | None = Field(
         default=None,
         description="The same failure as a countable code — low_text_yield, "

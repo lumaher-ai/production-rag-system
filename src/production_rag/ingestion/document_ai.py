@@ -147,9 +147,7 @@ class DocumentAIExtractor:
 
     # ─── Transport choice ───
 
-    def _needs_batch(
-        self, content: bytes, page_count: int | None, mime_type: str
-    ) -> bool:
+    def _needs_batch(self, content: bytes, page_count: int | None, mime_type: str) -> bool:
         """Whether this document is too big for the synchronous API.
 
         A non-PDF cannot be sharded — you would have to rewrite the OOXML — so
@@ -196,9 +194,7 @@ class DocumentAIExtractor:
 
         return list(await asyncio.gather(*(run(shard) for shard in shards)))
 
-    async def _process_online(
-        self, content: bytes, filename: str | None, mime_type: str
-    ) -> Any:
+    async def _process_online(self, content: bytes, filename: str | None, mime_type: str) -> Any:
         client = await self._get_client()
         request = documentai.ProcessRequest(
             name=self._processor_name(),
@@ -212,9 +208,7 @@ class DocumentAIExtractor:
 
     # ─── Batch path ───
 
-    async def _batch_process(
-        self, content: bytes, filename: str | None, mime_type: str
-    ) -> Any:
+    async def _batch_process(self, content: bytes, filename: str | None, mime_type: str) -> Any:
         """Process one large document through Cloud Storage.
 
         Staging is per-job and cleaned up in a ``finally``: the bucket is a
@@ -237,9 +231,7 @@ class DocumentAIExtractor:
 
         storage = _storage_client(self._settings.documentai_credentials_path)
         try:
-            await asyncio.to_thread(
-                _upload, storage, bucket, input_blob, content, mime_type
-            )
+            await asyncio.to_thread(_upload, storage, bucket, input_blob, content, mime_type)
 
             client = await self._get_client()
             request = documentai.BatchProcessRequest(
@@ -261,9 +253,7 @@ class DocumentAIExtractor:
                 process_options=_process_options(),
             )
             operation = await _call(client.batch_process_documents, request=request)
-            await _call(
-                operation.result, timeout=self._settings.documentai_batch_timeout_seconds
-            )
+            await _call(operation.result, timeout=self._settings.documentai_batch_timeout_seconds)
 
             return await asyncio.to_thread(
                 _read_batch_output, storage, bucket, output_prefix, filename
@@ -364,9 +354,7 @@ def _storage_client(credentials_path: str) -> Any:
     credentials = service_account.Credentials.from_service_account_file(
         credentials_path, scopes=[CLOUD_PLATFORM_SCOPE]
     )
-    return google.cloud.storage.Client(
-        credentials=credentials, project=credentials.project_id
-    )
+    return google.cloud.storage.Client(credentials=credentials, project=credentials.project_id)
 
 
 # ─── Cloud Storage helpers (the SDK is synchronous; callers thread them) ───
@@ -376,9 +364,7 @@ def _upload(storage: Any, bucket: str, name: str, content: bytes, mime_type: str
     storage.bucket(bucket).blob(name).upload_from_string(content, content_type=mime_type)
 
 
-def _read_batch_output(
-    storage: Any, bucket: str, output_prefix: str, filename: str | None
-) -> Any:
+def _read_batch_output(storage: Any, bucket: str, output_prefix: str, filename: str | None) -> Any:
     """Reassemble the Document the batch operation wrote.
 
     Document AI shards its output: one input file can produce several JSON
@@ -398,9 +384,7 @@ def _read_batch_output(
 
     merged = documentai.Document()
     for blob in blobs:
-        shard = documentai.Document.from_json(
-            blob.download_as_bytes(), ignore_unknown_fields=True
-        )
+        shard = documentai.Document.from_json(blob.download_as_bytes(), ignore_unknown_fields=True)
         merged.document_layout.blocks.extend(shard.document_layout.blocks)
     return merged
 
@@ -562,9 +546,7 @@ class _WalkState:
         body = "\n\n".join(part for part in self.buffer if part.strip()).strip()
         self.buffer = []
         if body:
-            segments.append(
-                ExtractedSegment(text=body, page=self.page, section=self.section)
-            )
+            segments.append(ExtractedSegment(text=body, page=self.page, section=self.section))
 
 
 def _walk(block: Any, state: _WalkState, segments: list[ExtractedSegment]) -> None:

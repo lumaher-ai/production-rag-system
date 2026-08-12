@@ -278,9 +278,7 @@ def extract_local(
     loader = resolve_loader(filename, content_type)
     if loader is None:
         logger.warning("upload_unsupported_type", filename=filename, content_type=content_type)
-        raise UnsupportedFileTypeError(
-            unsupported_type_message(filename, ocr_available=False)
-        )
+        raise UnsupportedFileTypeError(unsupported_type_message(filename, ocr_available=False))
 
     segments = [seg for seg in loader.extract(content, filename or "") if seg.text.strip()]
     logger.info(

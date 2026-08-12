@@ -100,9 +100,7 @@ async def _auth_token(client: AsyncClient, email: str) -> str:
         "/auth/signup",
         json={"name": "Jobs", "email": email, "password": "securepass123"},
     )
-    login = await client.post(
-        "/auth/login", json={"email": email, "password": "securepass123"}
-    )
+    login = await client.post("/auth/login", json={"email": email, "password": "securepass123"})
     return login.json()["access_token"]
 
 
@@ -128,9 +126,7 @@ async def test_upload_returns_202_with_a_job_id(
     assert [str(j) for j in job_queue.enqueued] == [body["job_id"]]
 
     # No document exists yet — that is the whole point of 202.
-    documents = await pg_session.execute(
-        select(Document).where(Document.source == body["source"])
-    )
+    documents = await pg_session.execute(select(Document).where(Document.source == body["source"]))
     assert documents.scalar_one_or_none() is None
 
 
@@ -338,9 +334,7 @@ async def test_resume_re_embeds_only_the_remaining_chunks(
     second = _mock_embeddings()
     await _service(pg_session, second, batch_size=10).run_job(job, get_settings())
 
-    embedded_on_retry = sum(
-        len(call.args[0]) for call in second.embed_batch.call_args_list
-    )
+    embedded_on_retry = sum(len(call.args[0]) for call in second.embed_batch.call_args_list)
     assert embedded_on_retry == job.total_chunks - already_done
 
 
@@ -390,9 +384,7 @@ async def test_unchanged_source_completes_without_embedding(
         filename="same.txt",
         content_type="text/plain",
     )
-    document = await _service(pg_session, _mock_embeddings()).run_job(
-        first_job, get_settings()
-    )
+    document = await _service(pg_session, _mock_embeddings()).run_job(first_job, get_settings())
     assert document is not None
 
     second_embeddings = _mock_embeddings()
@@ -403,9 +395,7 @@ async def test_unchanged_source_completes_without_embedding(
         filename="same.txt",
         content_type="text/plain",
     )
-    again = await _service(pg_session, second_embeddings).run_job(
-        second_job, get_settings()
-    )
+    again = await _service(pg_session, second_embeddings).run_job(second_job, get_settings())
 
     assert again is not None and again.id == document.id
     assert second_job.status == JobStatus.SUCCEEDED.value
@@ -446,9 +436,7 @@ async def test_status_endpoint_reports_progress_and_document(
     assert body["processed_chunks"] == body["total_chunks"] > 0
 
 
-async def test_status_of_another_users_job_is_404(
-    pg_async_client: AsyncClient, job_queue
-) -> None:
+async def test_status_of_another_users_job_is_404(pg_async_client: AsyncClient, job_queue) -> None:
     """Not 403 — confirming the id exists would leak another user's job."""
     owner_token = await _auth_token(pg_async_client, "owner-job@example.com")
     accepted = await pg_async_client.post(
@@ -475,9 +463,7 @@ async def test_unknown_job_is_404(pg_async_client: AsyncClient, job_queue) -> No
     assert response.status_code == 404
 
 
-async def test_jobs_list_is_scoped_to_owner(
-    pg_async_client: AsyncClient, job_queue
-) -> None:
+async def test_jobs_list_is_scoped_to_owner(pg_async_client: AsyncClient, job_queue) -> None:
     token = await _auth_token(pg_async_client, "listjobs@example.com")
     headers = {"Authorization": f"Bearer {token}"}
     await pg_async_client.post(
@@ -496,7 +482,6 @@ async def test_jobs_list_is_scoped_to_owner(
 async def test_jobs_endpoints_require_auth(pg_async_client: AsyncClient) -> None:
     assert (await pg_async_client.get("/documents/jobs")).status_code == 401
     assert (await pg_async_client.get(f"/documents/jobs/{uuid4()}")).status_code == 401
-
 
 
 # ─── Orphan recovery: a worker that dies never records a failure ───
@@ -669,15 +654,21 @@ async def test_unchanged_normalizer_still_short_circuits(pg_session: AsyncSessio
     source = f"upload://{user.id}/same-norm.txt"
 
     first = await jobs.create(
-        user_id=user.id, source=source, payload=LONG_TEXT.encode(),
-        filename="same-norm.txt", content_type="text/plain",
+        user_id=user.id,
+        source=source,
+        payload=LONG_TEXT.encode(),
+        filename="same-norm.txt",
+        content_type="text/plain",
     )
     await _service(pg_session, _mock_embeddings()).run_job(first, get_settings())
 
     second_embeddings = _mock_embeddings()
     second = await jobs.create(
-        user_id=user.id, source=source, payload=LONG_TEXT.encode(),
-        filename="same-norm.txt", content_type="text/plain",
+        user_id=user.id,
+        source=source,
+        payload=LONG_TEXT.encode(),
+        filename="same-norm.txt",
+        content_type="text/plain",
     )
     await _service(pg_session, second_embeddings).run_job(second, get_settings())
 
