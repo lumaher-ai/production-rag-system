@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Least privilege: nothing here writes to the repo.
+permissions:
+  contents: read
+
+# A new push to the same branch supersedes the run in flight.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Lint & types
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: true
+
+      # --frozen installs uv.lock exactly and fails if it has drifted from
+      # pyproject.toml, so a dependency added without relocking is caught here
+      # rather than producing a build that differs from every developer's.
+      # Python itself comes from .python-version (3.12); uv provisions it.
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: ruff (lint)
+        run: uv run ruff check .
+
+      - name: ruff (format)
+        run: uv run ruff format --check .
+
+      - name: mypy
+        run: uv run mypy src
+
+  tests:
+    name: Tests
+    runs-on: ubuntu-latest
+    # The pgvector suite pulls an image and starts a container per module.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      # No .env is created on purpose: every setting in config.py has a default,
+      # and the suite is verified to pass without one. If a future change makes
+      # a setting genuinely required, this job is where that surfaces.
+      #
+      # Docker is preinstalled on ubuntu-latest, so the ~84 tests using the
+      # opt-in `pg_engine` fixture (testcontainers + pgvector) really run here.
+      # That matters: this is the only place they run when a developer has
+      # Docker stopped locally.
+      - name: pytest
+        run: uv run pytest

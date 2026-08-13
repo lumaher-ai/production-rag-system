@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
@@ -15,7 +15,7 @@ class QueryCacheRepository:
 
     async def get(self, idempotency_key: str) -> QueryCache | None:
         """Return a live cache entry for the key, or None if missing/expired."""
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         result = await self._session.execute(
             select(QueryCache).where(
                 QueryCache.idempotency_key == idempotency_key,

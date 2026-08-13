@@ -40,7 +40,7 @@ from production_rag.exceptions import (
 )
 
 
-class FailureReason(str, enum.Enum):
+class FailureReason(enum.StrEnum):
     """What went wrong, at the granularity worth counting.
 
     Deliberately coarse. Every value here is a distinct thing an operator would
@@ -61,7 +61,7 @@ class FailureReason(str, enum.Enum):
     INTERNAL = "internal"
 
 
-class FailureStage(str, enum.Enum):
+class FailureStage(enum.StrEnum):
     """Where in the pipeline it happened."""
 
     FETCH = "fetch"

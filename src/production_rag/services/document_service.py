@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
@@ -335,9 +335,7 @@ class DocumentService:
         # Persist to the deterministic answer cache (conditional write; TTL from
         # config). Skipped when caching is disabled so evals never populate it.
         if use_cache:
-            expires_at = datetime.now(timezone.utc) + timedelta(
-                seconds=self._query_cache_ttl_seconds
-            )
+            expires_at = datetime.now(UTC) + timedelta(seconds=self._query_cache_ttl_seconds)
             await self._query_cache.put(
                 idempotency_key=cache_key,
                 user_id=user_id,

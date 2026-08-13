@@ -16,13 +16,17 @@ def configure_logging() -> None:
         level=log_level,
     )
 
-    shared_processors = [
+    # Annotated rather than inferred: mypy widens a heterogeneous list of
+    # callables to list[object], and infers `renderer` from whichever branch it
+    # sees first — so the console/JSON swap below reads as a type error.
+    shared_processors: list[structlog.typing.Processor] = [
         structlog.contextvars.merge_contextvars,
         structlog.processors.add_log_level,
         structlog.processors.TimeStamper(fmt="iso", utc=True),
         structlog.processors.StackInfoRenderer(),
     ]
 
+    renderer: structlog.typing.Processor
     if settings.environment == "development":
         renderer = structlog.dev.ConsoleRenderer(colors=True)
     else:

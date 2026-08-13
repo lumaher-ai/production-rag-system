@@ -1,5 +1,5 @@
 import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 from sqlalchemy import select
@@ -23,8 +23,7 @@ class RefreshTokenRepository:
         token = RefreshToken(
             token=secrets.token_urlsafe(64),
             user_id=user_id,
-            expires_at=datetime.now(timezone.utc)
-            + timedelta(days=settings.refresh_token_expire_days),
+            expires_at=datetime.now(UTC) + timedelta(days=settings.refresh_token_expire_days),
         )
         self._session.add(token)
         await self._session.flush()
@@ -35,7 +34,7 @@ class RefreshTokenRepository:
             select(RefreshToken).where(
                 RefreshToken.token == token_str,
                 RefreshToken.revoked == False,  # noqa: E712
-                RefreshToken.expires_at > datetime.now(timezone.utc),
+                RefreshToken.expires_at > datetime.now(UTC),
             )
         )
         token = result.scalar_one_or_none()
