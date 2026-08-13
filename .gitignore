@@ -210,3 +210,6 @@ __marimo__/
 
 # Screnshots for debugging
 debug_runs
+# Claude Code personal instructions
+CLAUDE.local.md
+.claude/settings.local.json

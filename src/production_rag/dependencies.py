@@ -147,9 +147,7 @@ def get_job_queue(request: Request) -> JobQueue:
     """
     queue = getattr(request.app.state, "job_queue", None)
     if queue is None:
-        raise RuntimeError(
-            "Job queue is not initialized — the application lifespan did not run."
-        )
+        raise RuntimeError("Job queue is not initialized — the application lifespan did not run.")
     return queue
 
 

@@ -71,9 +71,7 @@ async def _make_user(session: AsyncSession, email: str) -> User:
     return user
 
 
-async def _ingest(
-    session: AsyncSession, user: User, name: str, body: str, repeat: int = 8
-) -> None:
+async def _ingest(session: AsyncSession, user: User, name: str, body: str, repeat: int = 8) -> None:
     """Seed through the real ingestion path, so metadata is really extracted.
 
     ``repeat`` sets how many chunks the document produces (~1 per 1000 chars),
@@ -212,12 +210,18 @@ async def test_a_filter_matching_nothing_returns_nothing_not_everything(
     service = _service(pg_session)
 
     unknown_value = await service.retrieve(
-        question="cláusulas", user_id=user.id, top_k=10,
-        filters={"language": "ja"}, use_cache=False,
+        question="cláusulas",
+        user_id=user.id,
+        top_k=10,
+        filters={"language": "ja"},
+        use_cache=False,
     )
     unknown_key = await service.retrieve(
-        question="cláusulas", user_id=user.id, top_k=10,
-        filters={"classification": "top-secret"}, use_cache=False,
+        question="cláusulas",
+        user_id=user.id,
+        top_k=10,
+        filters={"classification": "top-secret"},
+        use_cache=False,
     )
 
     assert unknown_value == []
@@ -244,8 +248,11 @@ async def test_absent_keys_do_not_match_a_filter_on_that_key(
     )
 
     results = await _service(pg_session).retrieve(
-        question="cláusulas", user_id=user.id, top_k=10,
-        filters={"language": "es"}, use_cache=False,
+        question="cláusulas",
+        user_id=user.id,
+        top_k=10,
+        filters={"language": "es"},
+        use_cache=False,
     )
     assert results == []
 
@@ -260,9 +267,7 @@ async def test_an_empty_filter_is_equivalent_to_no_filter(
     await _ingest(pg_session, user, "invoice", ENGLISH_INVOICE)
 
     service = _service(pg_session)
-    baseline = await service.retrieve(
-        question="terms", user_id=user.id, top_k=10, use_cache=False
-    )
+    baseline = await service.retrieve(question="terms", user_id=user.id, top_k=10, use_cache=False)
     filtered = await service.retrieve(
         question="terms", user_id=user.id, top_k=10, filters=filters, use_cache=False
     )
@@ -384,7 +389,7 @@ async def test_a_filtered_search_returns_a_full_page_across_many_tenants(
         .select_from(DocumentChunk)
         .where(
             DocumentChunk.owner_id == target.id,
-            text("metadata @> '{\"language\":\"es\",\"doc_type\":\"contract\"}'::jsonb"),
+            text('metadata @> \'{"language":"es","doc_type":"contract"}\'::jsonb'),
         )
     )
     assert total is not None and matching is not None

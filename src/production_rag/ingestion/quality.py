@@ -176,10 +176,7 @@ def rejection(
     density = report.chars_per_page or 0.0
     coverage = ""
     if report.pages_with_text is not None and report.page_count:
-        coverage = (
-            f" Only {report.pages_with_text} of {report.page_count} pages "
-            f"produced any text."
-        )
+        coverage = f" Only {report.pages_with_text} of {report.page_count} pages produced any text."
 
     return LowTextYieldError(
         f"This document yielded {density:.0f} characters per page across "

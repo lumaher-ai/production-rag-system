@@ -64,9 +64,7 @@ async def test_upload_txt_is_accepted_and_ingested(
 
     await drain_jobs(pg_session, job_queue)
 
-    listed = await pg_async_client.get(
-        "/documents", headers={"Authorization": f"Bearer {token}"}
-    )
+    listed = await pg_async_client.get("/documents", headers={"Authorization": f"Bearer {token}"})
     document = next(d for d in listed.json() if d["source"] == accepted["source"])
     assert document["title"] == "notes"  # filename stem
     assert document["chunk_count"] > 0
@@ -90,9 +88,7 @@ async def test_upload_title_override(
     assert response.status_code == 202
     await drain_jobs(pg_session, job_queue)
 
-    listed = await pg_async_client.get(
-        "/documents", headers={"Authorization": f"Bearer {token}"}
-    )
+    listed = await pg_async_client.get("/documents", headers={"Authorization": f"Bearer {token}"})
     assert any(d["title"] == "Custom Title" for d in listed.json())
 
     app.dependency_overrides.pop(get_embedding_service, None)
@@ -157,9 +153,7 @@ async def test_upload_docx_persists_section_provenance(
     app.dependency_overrides.pop(get_embedding_service, None)
 
 
-async def test_upload_unsupported_type_returns_415(
-    pg_async_client: AsyncClient, job_queue
-) -> None:
+async def test_upload_unsupported_type_returns_415(pg_async_client: AsyncClient, job_queue) -> None:
     app.dependency_overrides[get_embedding_service] = _mock_embedding_service
     token = await _auth_token(pg_async_client, "unsupported@example.com")
 
@@ -174,9 +168,7 @@ async def test_upload_unsupported_type_returns_415(
     app.dependency_overrides.pop(get_embedding_service, None)
 
 
-async def test_upload_oversized_returns_413(
-    pg_async_client: AsyncClient, job_queue
-) -> None:
+async def test_upload_oversized_returns_413(pg_async_client: AsyncClient, job_queue) -> None:
     from production_rag.config import get_settings
 
     app.dependency_overrides[get_embedding_service] = _mock_embedding_service

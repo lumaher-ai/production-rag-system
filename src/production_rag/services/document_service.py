@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
@@ -58,6 +58,7 @@ class ScoredChunk:
 
     chunk: DocumentChunk
     score: float
+
 
 # Chunking config
 CHUNK_SIZE = 1000
@@ -138,6 +139,7 @@ def build_chunks(segments: list[ExtractedSegment]) -> tuple[str, list[PreparedCh
         base_offset += len(seg.text) + sep_len
 
     return full_content, chunks
+
 
 # Prompt
 
@@ -282,9 +284,7 @@ class DocumentService:
         # Step 2: Build context from chunks (Augmented)
         context_parts = []
         for i, sc in enumerate(scored_chunks):
-            context_parts.append(
-                f"[Source {i + 1}: {sc.chunk.document_title}]\n{sc.chunk.content}"
-            )
+            context_parts.append(f"[Source {i + 1}: {sc.chunk.document_title}]\n{sc.chunk.content}")
         context = "\n\n---\n\n".join(context_parts)
 
         # Step 3: Call LLM with context (Generation)
@@ -335,9 +335,7 @@ class DocumentService:
         # Persist to the deterministic answer cache (conditional write; TTL from
         # config). Skipped when caching is disabled so evals never populate it.
         if use_cache:
-            expires_at = datetime.now(timezone.utc) + timedelta(
-                seconds=self._query_cache_ttl_seconds
-            )
+            expires_at = datetime.now(UTC) + timedelta(seconds=self._query_cache_ttl_seconds)
             await self._query_cache.put(
                 idempotency_key=cache_key,
                 user_id=user_id,

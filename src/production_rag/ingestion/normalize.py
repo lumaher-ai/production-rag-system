@@ -90,9 +90,7 @@ def normalize_text(text: str) -> str:
     #    vertical tabs, and bidi marks all show up in real PDF extractions).
     text = text.translate(_INVISIBLE)
     text = "".join(
-        ch
-        for ch in text
-        if ch in "\n\t" or unicodedata.category(ch) not in ("Cc", "Cf")
+        ch for ch in text if ch in "\n\t" or unicodedata.category(ch) not in ("Cc", "Cf")
     )
 
     # 4. Collapse intra-line whitespace runs, and strip whitespace around

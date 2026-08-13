@@ -111,8 +111,7 @@ class IngestionService:
         # incompatible processings into one document — with nothing downstream
         # able to detect it.
         if job.processed_chunks > 0 and (
-            job.chunker_version != CHUNKER_VERSION
-            or job.normalizer_version != NORMALIZER_VERSION
+            job.chunker_version != CHUNKER_VERSION or job.normalizer_version != NORMALIZER_VERSION
         ):
             logger.warning(
                 "ingestion_job_config_changed",
@@ -162,9 +161,7 @@ class IngestionService:
 
     # ─── Stages ───
 
-    async def _materialize(
-        self, job: IngestionJob, settings: Settings
-    ) -> MaterializedSource:
+    async def _materialize(self, job: IngestionJob, settings: Settings) -> MaterializedSource:
         """Get the document's bytes and parse them into segments.
 
         Uploads carry their bytes on the job row (the worker cannot read the
@@ -327,9 +324,7 @@ class IngestionService:
         embedding_model = self._embeddings.model
         resuming = job is not None and job.processed_chunks > 0
 
-        existing = await self._documents.find_document_by_source(
-            user_id=user_id, source=source
-        )
+        existing = await self._documents.find_document_by_source(user_id=user_id, source=source)
 
         # Unchanged content short-circuits before any embedding spend. Skipped
         # when resuming: the hash already matches (the document row was written
@@ -412,9 +407,7 @@ class IngestionService:
             metadata=metadata,
         )
         if document is None:  # lost a concurrent race; the winner owns this source
-            return await self._documents.find_document_by_source(
-                user_id=user_id, source=source
-            )
+            return await self._documents.find_document_by_source(user_id=user_id, source=source)
 
         if job is not None and self._jobs is not None:
             await self._jobs.set_plan(job, len(chunks), NORMALIZER_VERSION, CHUNKER_VERSION)
@@ -520,9 +513,7 @@ class IngestionService:
             batch = chunks[offset : offset + self._batch_size]
             embeddings = await self._embeddings.embed_batch([c.text for c in batch])
 
-            for position, (chunk, embedding) in enumerate(
-                zip(batch, embeddings, strict=True)
-            ):
+            for position, (chunk, embedding) in enumerate(zip(batch, embeddings, strict=True)):
                 await self._documents.create_chunk(
                     document_id=document.id,
                     owner_id=user_id,

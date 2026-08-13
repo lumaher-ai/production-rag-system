@@ -65,8 +65,7 @@ def _remedy(settings: Settings, *, ocr_attempted: bool) -> str:
         return "Document AI OCR was applied and still produced too little text."
     if not settings.ocr_enabled:
         return (
-            "OCR is disabled on this deployment — set OCR_ENABLED=true to ingest "
-            "scanned documents."
+            "OCR is disabled on this deployment — set OCR_ENABLED=true to ingest scanned documents."
         )
     return (
         "OCR is enabled but not configured — set DOCUMENTAI_PROJECT_ID and "
@@ -120,9 +119,7 @@ async def extract_segments(
     # ─── Formats with no local loader go straight out to the extractor ───
     if mime not in LOADER_REGISTRY:
         if extractor is None:
-            raise UnsupportedFileTypeError(
-                unsupported_type_message(filename, ocr_available=False)
-            )
+            raise UnsupportedFileTypeError(unsupported_type_message(filename, ocr_available=False))
         return await _extract_with_ocr(
             extractor, content, filename, mime, settings, threshold, local_report=None
         )
@@ -189,9 +186,7 @@ async def _extract_with_ocr(
     them is the user's problem.
     """
     segments = await extractor.extract(content, filename, mime)
-    report = quality.assess(
-        segments, content=content, mime_type=mime, method=extractor.version
-    )
+    report = quality.assess(segments, content=content, mime_type=mime, method=extractor.version)
     logger.info(
         "extraction_assessed",
         filename=filename,

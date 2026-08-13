@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 from jose import JWTError, jwt
@@ -6,7 +6,6 @@ from passlib.context import CryptContext
 
 from production_rag.config import get_settings
 from production_rag.exceptions import PaddingtonError
-from production_rag.models import refresh_token
 from production_rag.repositories.refresh_token_repository import RefreshTokenRepository
 from production_rag.repositories.user_repository import UserRepository
 from production_rag.schemas.auth import TokenResponse
@@ -32,14 +31,14 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
 
 def create_access_token(user_id: UUID, email: str, role: str) -> str:
     settings = get_settings()
-    expire = datetime.now(timezone.utc) + timedelta(minutes=settings.jwt_expire_minutes)
+    expire = datetime.now(UTC) + timedelta(minutes=settings.jwt_expire_minutes)
 
     payload = {
         "sub": str(user_id),
         "email": email,
         "role": role,
         "exp": expire,
-        "iat": datetime.now(timezone.utc),
+        "iat": datetime.now(UTC),
         "jti": str(uuid4()),
     }
 

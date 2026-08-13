@@ -325,7 +325,7 @@ def _accumulate_usage(messages: list, model: str) -> tuple[float, int, int]:
     return total_cost, total_input, total_output
 
 
-class BudgetMiddleware(AgentMiddleware):
+class BudgetMiddleware(AgentMiddleware[AgentState, AgentInvocationContext, Any]):
     """Halt the agent when *this turn's* LLM cost exceeds the configured budget.
 
     Reads `runtime.context.baseline_message_count` to ignore messages from

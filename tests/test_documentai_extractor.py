@@ -302,9 +302,7 @@ async def test_batch_without_a_bucket_fails_before_spending() -> None:
         (gexc.InvalidArgument("bad pdf"), ValidationError, 422),
     ],
 )
-async def test_google_errors_map_onto_the_local_taxonomy(
-    google_error, expected, status
-) -> None:
+async def test_google_errors_map_onto_the_local_taxonomy(google_error, expected, status) -> None:
     """The mapping is what decides retry: a 429 comes back, a bad file does not."""
     client = FakeDocumentAIClient(error=google_error)
 
@@ -322,16 +320,17 @@ def test_the_processor_version_is_pinned_in_the_resource_name() -> None:
     client = FakeDocumentAIClient()
     name = _extractor(client)._processor_name()
 
-    assert name.endswith(
-        f"/processorVersions/{get_settings().documentai_processor_version}"
-    )
+    assert name.endswith(f"/processorVersions/{get_settings().documentai_processor_version}")
     assert "/processors/abc123/" in name
 
 
 def test_missing_credentials_are_a_configuration_error_not_a_crash() -> None:
     settings = get_settings().model_copy(
-        update={"ocr_enabled": True, "documentai_service_account_file": "",
-                "google_service_account_file": ""}
+        update={
+            "ocr_enabled": True,
+            "documentai_service_account_file": "",
+            "google_service_account_file": "",
+        }
     )
     with pytest.raises(ConnectorNotConfiguredError) as excinfo:
         document_ai._load_credentials(settings)
@@ -354,9 +353,7 @@ async def test_a_real_client_can_be_constructed_from_inside_the_event_loop(
     path; this one builds the genuine `DocumentProcessorServiceAsyncClient` with
     fake credentials. No network: constructing a channel does not connect.
     """
-    monkeypatch.setattr(
-        document_ai, "_load_credentials", lambda _s: AnonymousCredentials()
-    )
+    monkeypatch.setattr(document_ai, "_load_credentials", lambda _s: AnonymousCredentials())
 
     extractor = DocumentAIExtractor(_configured())
     client = await extractor._get_client()

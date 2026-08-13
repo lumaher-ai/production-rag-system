@@ -85,9 +85,7 @@ class FailedIngestion(Base):
     # or the failure is one that retrying cannot change (a scanned PDF is still
     # a scanned PDF on attempt three). This is the flag that makes the table a
     # dead-letter queue rather than a log.
-    is_terminal: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False, index=True
-    )
+    is_terminal: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
 
     # Measurements from the failure, when it had any — today the quality gate's
     # chars-per-page numbers. JSONB rather than columns for the same reason

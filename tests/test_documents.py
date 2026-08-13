@@ -71,9 +71,7 @@ async def test_upload_document_creates_document_via_worker(
 
     await drain_jobs(pg_session, job_queue, mock_emb)
 
-    listed = await pg_async_client.get(
-        "/documents", headers={"Authorization": f"Bearer {token}"}
-    )
+    listed = await pg_async_client.get("/documents", headers={"Authorization": f"Bearer {token}"})
     document = next(d for d in listed.json() if d["title"] == "Test Document")
     assert document["chunk_count"] > 0
 

@@ -70,9 +70,7 @@ async def upload_file(
     # spreadsheet is ingestible where Document AI is configured and a 415 where
     # it is not, and saying so now beats a 202 followed by a job that fails a
     # second later with the same message.
-    if not is_ingestible(
-        file.filename, file.content_type, ocr_available=settings.ocr_available
-    ):
+    if not is_ingestible(file.filename, file.content_type, ocr_available=settings.ocr_available):
         raise UnsupportedFileTypeError(
             unsupported_type_message(file.filename, ocr_available=settings.ocr_available)
         )
