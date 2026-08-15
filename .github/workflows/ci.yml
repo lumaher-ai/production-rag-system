@@ -22,7 +22,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: astral-sh/setup-uv@v10
+      # Pinned to a full release tag: setup-uv publishes v10 releases but only
+      # maintains floating major tags through v7, so `@v10` does not resolve.
+      - uses: astral-sh/setup-uv@v10.0.1
         with:
           enable-cache: true
 
@@ -50,7 +52,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: astral-sh/setup-uv@v10
+      # Pinned to a full release tag: setup-uv publishes v10 releases but only
+      # maintains floating major tags through v7, so `@v10` does not resolve.
+      - uses: astral-sh/setup-uv@v10.0.1
         with:
           enable-cache: true
 
