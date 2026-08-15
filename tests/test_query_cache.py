@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
 from uuid import UUID
 
@@ -10,10 +10,10 @@ from production_rag.dependencies import get_embedding_service, get_llm_client
 from production_rag.llm.client import LLMClient, LLMResponse
 from production_rag.llm.embedding_service import EmbeddingService
 from production_rag.main import app
-from tests._jobs import drain_jobs
 from production_rag.models import User
 from production_rag.repositories.query_cache_repository import QueryCacheRepository
 from production_rag.services.auth_service import hash_password
+from tests._jobs import drain_jobs
 
 pytestmark = pytest.mark.asyncio(loop_scope="module")
 
@@ -67,11 +67,11 @@ async def test_cache_get_respects_ttl(pg_session: AsyncSession) -> None:
     uid = await _make_user(pg_session, "ttl@example.com")
     repo = QueryCacheRepository(pg_session)
 
-    past = datetime.now(timezone.utc) - timedelta(seconds=1)
+    past = datetime.now(UTC) - timedelta(seconds=1)
     await repo.put("k-expired", uid, {"answer": "x"}, expires_at=past)
     assert await repo.get("k-expired") is None  # expired → miss
 
-    future = datetime.now(timezone.utc) + timedelta(hours=1)
+    future = datetime.now(UTC) + timedelta(hours=1)
     await repo.put("k-live", uid, {"answer": "y"}, expires_at=future)
     live = await repo.get("k-live")
     assert live is not None and live.response_json["answer"] == "y"
@@ -80,7 +80,7 @@ async def test_cache_get_respects_ttl(pg_session: AsyncSession) -> None:
 async def test_cache_put_is_conditional(pg_session: AsyncSession) -> None:
     uid = await _make_user(pg_session, "cond@example.com")
     repo = QueryCacheRepository(pg_session)
-    future = datetime.now(timezone.utc) + timedelta(hours=1)
+    future = datetime.now(UTC) + timedelta(hours=1)
 
     await repo.put("dup", uid, {"answer": "first"}, expires_at=future)
     await repo.put("dup", uid, {"answer": "second"}, expires_at=future)  # no error, ignored
@@ -92,7 +92,7 @@ async def test_cache_put_is_conditional(pg_session: AsyncSession) -> None:
 async def test_cache_delete_by_user(pg_session: AsyncSession) -> None:
     uid = await _make_user(pg_session, "del@example.com")
     repo = QueryCacheRepository(pg_session)
-    future = datetime.now(timezone.utc) + timedelta(hours=1)
+    future = datetime.now(UTC) + timedelta(hours=1)
     await repo.put("d-a", uid, {"answer": "a"}, expires_at=future)
     await repo.put("d-b", uid, {"answer": "b"}, expires_at=future)
 

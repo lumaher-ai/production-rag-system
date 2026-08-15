@@ -374,7 +374,5 @@ async def test_ingest_upstream_404_fails_the_job(
 
 
 async def test_ingest_requires_auth(pg_async_client: AsyncClient, origin: str) -> None:
-    response = await pg_async_client.post(
-        "/documents/ingest", json={"uri": f"{origin}/report.md"}
-    )
+    response = await pg_async_client.post("/documents/ingest", json={"uri": f"{origin}/report.md"})
     assert response.status_code == 401

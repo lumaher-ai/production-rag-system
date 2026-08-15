@@ -84,9 +84,7 @@ def _ocr_off(**overrides):
 
 
 def _dense(pages: int) -> list[ExtractedSegment]:
-    return [
-        ExtractedSegment(text="Recovered prose. " * 40, page=i + 1) for i in range(pages)
-    ]
+    return [ExtractedSegment(text="Recovered prose. " * 40, page=i + 1) for i in range(pages)]
 
 
 # ─── A document that parses fine never reaches the expensive path ───
@@ -138,9 +136,7 @@ async def test_a_fully_scanned_pdf_reaches_ocr() -> None:
 async def test_a_fully_scanned_pdf_without_ocr_explains_what_it_is() -> None:
     """The bare "nothing found" said nothing about why or what would fix it."""
     with pytest.raises(LowTextYieldError) as excinfo:
-        await extract_segments(
-            make_scanned_pdf(8, text_pages=0), "scan.pdf", PDF_MIME, _ocr_off()
-        )
+        await extract_segments(make_scanned_pdf(8, text_pages=0), "scan.pdf", PDF_MIME, _ocr_off())
 
     assert "Every page is an image" in excinfo.value.detail
     assert "scanned document" in excinfo.value.detail
@@ -170,22 +166,18 @@ async def test_a_scanned_pdf_escalates_and_the_ocr_result_wins() -> None:
 
 async def test_a_scan_with_ocr_off_is_rejected_with_a_pointer_to_the_fix() -> None:
     with pytest.raises(LowTextYieldError) as excinfo:
-        await extract_segments(
-            make_scanned_pdf(20, text_pages=1), "scan.pdf", PDF_MIME, _ocr_off()
-        )
+        await extract_segments(make_scanned_pdf(20, text_pages=1), "scan.pdf", PDF_MIME, _ocr_off())
 
     assert "OCR is disabled" in excinfo.value.detail
     assert "OCR_ENABLED=true" in excinfo.value.detail
 
 
 async def test_ocr_enabled_but_unconfigured_says_so_specifically() -> None:
-    """"Enabled" and "addressed" are different problems with different fixes."""
+    """ "Enabled" and "addressed" are different problems with different fixes."""
     settings = _ocr_off(ocr_enabled=True)
 
     with pytest.raises(LowTextYieldError) as excinfo:
-        await extract_segments(
-            make_scanned_pdf(20, text_pages=1), "scan.pdf", PDF_MIME, settings
-        )
+        await extract_segments(make_scanned_pdf(20, text_pages=1), "scan.pdf", PDF_MIME, settings)
 
     assert "not configured" in excinfo.value.detail
     assert "DOCUMENTAI_PROCESSOR_ID" in excinfo.value.detail
@@ -261,9 +253,7 @@ async def _auth_token(client: AsyncClient, email: str) -> str:
         "/auth/signup",
         json={"name": "Uploader", "email": email, "password": "securepass123"},
     )
-    login = await client.post(
-        "/auth/login", json={"email": email, "password": "securepass123"}
-    )
+    login = await client.post("/auth/login", json={"email": email, "password": "securepass123"})
     return login.json()["access_token"]
 
 
@@ -374,9 +364,7 @@ async def test_the_cache_survives_a_failed_attempt(
     broken.embed_batch.side_effect = RuntimeError("embedding provider is down")
     broken.model = "text-embedding-3-small"
 
-    job = await drain_expecting_failure(
-        pg_session, job_queue, settings=settings, embeddings=broken
-    )
+    job = await drain_expecting_failure(pg_session, job_queue, settings=settings, embeddings=broken)
     assert len(ocr.calls) == 1
     assert job.extracted_segments is not None
     assert job.extracted_segments["method"] == DOCAI_EXTRACTOR_VERSION

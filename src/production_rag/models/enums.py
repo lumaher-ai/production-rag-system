@@ -1,12 +1,12 @@
 import enum
 
 
-class UserRole(str, enum.Enum):
+class UserRole(enum.StrEnum):
     USER = "user"
     ADMIN = "admin"
 
 
-class JobStatus(str, enum.Enum):
+class JobStatus(enum.StrEnum):
     """Lifecycle of an ingestion job.
 
     ``pending`` and ``running`` are non-terminal; ``succeeded`` and ``failed``

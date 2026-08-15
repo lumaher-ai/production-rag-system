@@ -76,9 +76,7 @@ def upgrade() -> None:
         sa.Column("stage", sa.String(length=16), nullable=False),
         sa.Column("error", sa.Text(), nullable=False),
         sa.Column("attempt", sa.Integer(), nullable=False),
-        sa.Column(
-            "is_terminal", sa.Boolean(), nullable=False, server_default=sa.text("false")
-        ),
+        sa.Column("is_terminal", sa.Boolean(), nullable=False, server_default=sa.text("false")),
         sa.Column(
             "diagnostics",
             postgresql.JSONB(astext_type=sa.Text()),

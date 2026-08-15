@@ -140,9 +140,7 @@ def downgrade() -> None:
     op.drop_table("query_cache")
 
     op.drop_index("ix_document_chunks_owner_id", table_name="document_chunks")
-    op.drop_constraint(
-        "fk_document_chunks_owner_id_users", "document_chunks", type_="foreignkey"
-    )
+    op.drop_constraint("fk_document_chunks_owner_id_users", "document_chunks", type_="foreignkey")
     op.drop_column("document_chunks", "owner_id")
 
     op.drop_constraint("uq_documents_idempotency", "documents", type_="unique")

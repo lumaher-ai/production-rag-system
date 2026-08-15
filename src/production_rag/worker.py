@@ -78,8 +78,7 @@ async def ingest_document(ctx: dict[str, Any], job_id: str) -> str:
             await session.rollback()
             classification = classify(exc)
             terminal = (
-                not classification.retryable
-                or job.attempts >= settings.ingestion_max_attempts
+                not classification.retryable or job.attempts >= settings.ingestion_max_attempts
             )
             message = f"{type(exc).__name__}: {exc}"
 

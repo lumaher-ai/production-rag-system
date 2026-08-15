@@ -96,3 +96,38 @@ def test_settings_resolves_the_service_account_field(
 
 def test_settings_leaves_unconfigured_service_account_empty() -> None:
     assert Settings(google_service_account_file="").google_service_account_file == ""
+
+
+def test_no_setting_is_required() -> None:
+    """CI checks out the repo and runs the suite with no ``.env`` at all.
+
+    That works today only because every field carries a default. Adding one
+    without a default makes CI red, a fresh clone unrunnable, and any deploy
+    that forgot the variable fail — and it fails *far from its cause*, wherever
+    ``get_settings()`` is first called rather than at the line that introduced
+    it. This pins the property so the break names the field instead.
+    """
+    required = sorted(name for name, f in Settings.model_fields.items() if f.is_required())
+
+    assert required == [], (
+        "These settings have no default, so anything without a .env cannot start: "
+        f"{', '.join(required)}. Give each one a default (empty string means "
+        "'not configured', which is a valid state here), or teach CI to supply it."
+    )
+
+
+def test_settings_load_from_a_directory_with_no_env_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The end-to-end form of the above: ``env_file`` is resolved per CWD.
+
+    Constructing from an empty directory is what a CI runner does. Kept separate
+    from the field check because this one can be masked by variables exported in
+    a developer's shell, while the field check cannot.
+    """
+    monkeypatch.chdir(tmp_path)
+
+    settings = Settings()
+
+    assert settings.app_name
+    assert settings.database_url

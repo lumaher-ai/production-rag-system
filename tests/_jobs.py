@@ -133,9 +133,7 @@ async def drain_expecting_failure(
     except Exception as exc:
         await session.rollback()
         classification = classify(exc)
-        terminal = (
-            not classification.retryable or job.attempts >= settings.ingestion_max_attempts
-        )
+        terminal = not classification.retryable or job.attempts >= settings.ingestion_max_attempts
         message = f"{type(exc).__name__}: {exc}"
         await jobs.mark_failed(job, message, reason=classification.reason.value)
         await failures.record(

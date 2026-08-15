@@ -58,9 +58,7 @@ class IngestionJobRepository:
 
     async def get(self, job_id: UUID) -> IngestionJob:
         """Fetch by id without an owner check — worker use only."""
-        result = await self._session.execute(
-            select(IngestionJob).where(IngestionJob.id == job_id)
-        )
+        result = await self._session.execute(select(IngestionJob).where(IngestionJob.id == job_id))
         job = result.scalar_one_or_none()
         if job is None:
             raise IngestionJobNotFoundError(f"Ingestion job {job_id} not found")

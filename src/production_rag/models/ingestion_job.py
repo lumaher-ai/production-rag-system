@@ -71,9 +71,7 @@ class IngestionJob(Base):
     # Cleared with `payload` on success. Deliberately *not* cleared by
     # `reset_progress` — extraction does not depend on the normalizer or chunker,
     # so a version change invalidates the cursor and not this.
-    extracted_segments: Mapped[dict[str, Any] | None] = mapped_column(
-        MetadataJSON, nullable=True
-    )
+    extracted_segments: Mapped[dict[str, Any] | None] = mapped_column(MetadataJSON, nullable=True)
 
     # ─── Progress ───
     # Known only after parsing and chunking, hence nullable.
@@ -109,9 +107,7 @@ class IngestionJob(Base):
     # failure handler, so its job would otherwise sit in 'running' forever with
     # nothing to retry it. The sweeper uses a stale heartbeat to tell "died" from
     # "still working", which a single started_at timestamp cannot express.
-    heartbeat_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

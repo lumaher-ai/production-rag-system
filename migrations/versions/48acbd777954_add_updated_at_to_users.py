@@ -7,7 +7,7 @@ Create Date: 2026-04-20 20:03:58.641571
 """
 
 from collections.abc import Sequence
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import sqlalchemy as sa
 from alembic import op
@@ -25,7 +25,7 @@ def upgrade() -> None:
     # Step 1: Add the column allowing NULL temporarily
     op.add_column("users", sa.Column("updated_at", sa.DateTime(timezone=True), nullable=True))
     # Step 2: Fill existing rows with the current timestamp
-    op.execute(f"UPDATE users SET updated_at = '{datetime.now(timezone.utc).isoformat()}'")
+    op.execute(f"UPDATE users SET updated_at = '{datetime.now(UTC).isoformat()}'")
     # Step 3: Now that all rows have a value, set NOT NULL
     op.alter_column("users", "updated_at", nullable=False)
     # ### end Alembic commands ###

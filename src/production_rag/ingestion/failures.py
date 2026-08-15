@@ -40,7 +40,7 @@ from production_rag.exceptions import (
 )
 
 
-class FailureReason(str, enum.Enum):
+class FailureReason(enum.StrEnum):
     """What went wrong, at the granularity worth counting.
 
     Deliberately coarse. Every value here is a distinct thing an operator would
@@ -61,7 +61,7 @@ class FailureReason(str, enum.Enum):
     INTERNAL = "internal"
 
 
-class FailureStage(str, enum.Enum):
+class FailureStage(enum.StrEnum):
     """Where in the pipeline it happened."""
 
     FETCH = "fetch"
@@ -93,15 +93,11 @@ _BY_TYPE: tuple[tuple[type[Exception], FailureClassification], ...] = (
     ),
     (
         InvalidSourceURIError,
-        FailureClassification(
-            FailureReason.INVALID_SOURCE, FailureStage.FETCH, retryable=False
-        ),
+        FailureClassification(FailureReason.INVALID_SOURCE, FailureStage.FETCH, retryable=False),
     ),
     (
         UnsupportedFileTypeError,
-        FailureClassification(
-            FailureReason.UNSUPPORTED_TYPE, FailureStage.PARSE, retryable=False
-        ),
+        FailureClassification(FailureReason.UNSUPPORTED_TYPE, FailureStage.PARSE, retryable=False),
     ),
     (
         FileTooLargeError,
@@ -112,9 +108,7 @@ _BY_TYPE: tuple[tuple[type[Exception], FailureClassification], ...] = (
         # Retrying cannot conjure them, and three attempts only delays the
         # operator noticing.
         ConnectorNotConfiguredError,
-        FailureClassification(
-            FailureReason.OCR_NOT_CONFIGURED, FailureStage.OCR, retryable=False
-        ),
+        FailureClassification(FailureReason.OCR_NOT_CONFIGURED, FailureStage.OCR, retryable=False),
     ),
     (
         # Upstream: DNS, a 404 from the origin, a rate limit, a blocked address.

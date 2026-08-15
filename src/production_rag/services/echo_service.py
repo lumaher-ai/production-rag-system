@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from production_rag.logging_config import get_logger
 from production_rag.schemas.echo import EchoRequest, EchoResponse
@@ -15,7 +15,7 @@ def create_echo(request: EchoRequest) -> EchoResponse:
     response = EchoResponse(
         original=request.message,
         echoed=[request.message] * request.repeat,
-        received_at=datetime.now(timezone.utc),
+        received_at=datetime.now(UTC),
     )
     logger.info(
         "echo_created",

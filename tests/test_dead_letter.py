@@ -126,9 +126,7 @@ async def _auth_token(client: AsyncClient, email: str) -> str:
         "/auth/signup",
         json={"name": "Operator", "email": email, "password": "securepass123"},
     )
-    login = await client.post(
-        "/auth/login", json={"email": email, "password": "securepass123"}
-    )
+    login = await client.post("/auth/login", json={"email": email, "password": "securepass123"})
     return login.json()["access_token"]
 
 
@@ -272,9 +270,7 @@ async def test_terminal_only_filter_hides_in_flight_failures(
     headers = {"Authorization": f"Bearer {token}"}
     # Default asks "what needs me?" — a job awaiting retry does not.
     assert await _json(pg_async_client, "/documents/failures", headers) == []
-    history = await _json(
-        pg_async_client, "/documents/failures?terminal_only=false", headers
-    )
+    history = await _json(pg_async_client, "/documents/failures?terminal_only=false", headers)
     assert len(history) == 1
     assert history[0]["reason"] == FailureReason.FETCH_FAILED.value
 

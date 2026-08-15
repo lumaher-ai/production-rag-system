@@ -108,8 +108,7 @@ def _assert_public_address(host: str, settings: Settings) -> None:
         ):
             logger.warning("source_fetch_blocked_address", host=host, address=str(address))
             raise SourceFetchError(
-                f"Refusing to fetch from '{host}': it resolves to the non-public "
-                f"address {address}."
+                f"Refusing to fetch from '{host}': it resolves to the non-public address {address}."
             )
 
 
@@ -208,9 +207,7 @@ class HttpConnector:
                     bytes=len(content),
                     content_type=content_type,
                 )
-                return FetchedBytes(
-                    content=content, filename=filename, content_type=content_type
-                )
+                return FetchedBytes(content=content, filename=filename, content_type=content_type)
 
         raise SourceFetchError(
             f"Source '{parsed.uri}' exceeded {settings.source_fetch_max_redirects} redirects."
@@ -239,8 +236,7 @@ class GoogleDriveConnector:
             )
             if meta_response.status_code == 404:
                 raise SourceFetchError(
-                    f"Drive file '{file_id}' not found, or not shared with the "
-                    f"service account."
+                    f"Drive file '{file_id}' not found, or not shared with the service account."
                 )
             if meta_response.status_code >= 400:
                 raise SourceFetchError(
