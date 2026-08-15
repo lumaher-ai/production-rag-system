@@ -1,7 +1,7 @@
 ---
 name: pr
 description: Write a pull request description as an architectural report — the decisions, the criterion behind each one, and the trade-off accepted — then open the PR. Use whenever a branch is ready to merge, or when asked for a PR, a PR description, a branch write-up, or a rewrite of an existing PR body.
-disable-model-invocation: true
+disable-model-invocation: false
 ---
 
 `$ARGUMENTS` may name a branch, an existing PR number, or nothing — default to the current branch
