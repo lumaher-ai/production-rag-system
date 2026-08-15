@@ -1,7 +1,7 @@
 ---
 name: pr
 description: Write a pull request description as an architectural report — the decisions, the criterion behind each one, and the trade-off accepted — then open the PR. Use whenever a branch is ready to merge, or when asked for a PR, a PR description, a branch write-up, or a rewrite of an existing PR body.
-disable-model-invocation: true
+disable-model-invocation: false
 ---
 
 `$ARGUMENTS` may name a branch, an existing PR number, or nothing — default to the current branch
@@ -107,10 +107,10 @@ On approval, write the body to a file and pass `--body-file` — inline `--body`
 `$` in a shell. Base is `main` unless told otherwise.
 
 **Check whether the branch is pushed first.** If it isn't, stop and ask — pushing writes state to the
-remote, and per `CLAUDE.local.md` no git command that writes state runs without approval. Same for a
+remote, and no git command that writes state runs without approval. Same for a
 branch that has diverged from its upstream.
 
 If `$ARGUMENTS` named an existing PR, edit that one rather than opening a second.
 
-Afterwards, run the ownership check from `CLAUDE.local.md` — writing the body file is a tool write
+Afterwards, run the ownership check from `CLAUDE.md` — writing the body file is a tool write
 like any other.

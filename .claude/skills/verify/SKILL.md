@@ -17,8 +17,6 @@ Notes that change how you read the output:
   opt-in `pg_engine` fixture (testcontainers + pgvector). With Docker down, those 84 report as
   `ERROR ... docker.errors.DockerException`, not as failures. Say "84 blocked on Docker" rather than
   reporting a suite failure — and never count them as regressions.
-- The repo currently has **100 pre-existing `ruff check` findings** and the tree was `ruff format`ed
-  on 2026-08-12. Compare against that baseline; a fresh finding is one that isn't in the 100.
 - `mypy` is scoped to `src` only. Type errors in `tests/` are not part of this gate.
 - ruff is configured with `line-length = 100` and `select = ["E", "F", "I", "N", "UP", "B", "SIM"]`.
   `I` findings are import ordering and are auto-fixable with `uv run ruff check --fix .`.
